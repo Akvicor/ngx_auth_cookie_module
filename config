@@ -1,0 +1,32 @@
+#  ngx_http_auth_cookie_module — nginx 第三方认证模块
+#  提供 auth_cookie_* 配置项,通过 HMAC 签名 cookie 会话认证,
+#  使用方式与 auth_basic 一致(server/location 声明即启用)。
+
+ngx_addon_name=ngx_http_auth_cookie_module
+
+# 依赖 nginx 的 ngx_crypt()(bcrypt 走 libc crypt),需 NGX_CRYPT 宏与 $CRYPT_LIB;
+# secret 生成使用 OpenSSL RAND_bytes,依赖 $NGX_OPENSSL_LIBS(--with-http_ssl_module 已开启)。
+have=NGX_CRYPT . auto/have
+
+ngx_module_libs="$CRYPT_LIB $NGX_OPENSSL_LIBS"
+
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP
+    ngx_module_name=ngx_http_auth_cookie_module
+    ngx_module_incs=
+    ngx_module_deps=
+    ngx_module_srcs="$ngx_addon_dir/ngx_http_auth_cookie_module.c \
+                     $ngx_addon_dir/ngx_http_auth_cookie_util.c \
+                     $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \
+                     $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.c \
+                     $ngx_addon_dir/ngx_http_auth_cookie_page.c"
+    . auto/module
+else
+    HTTP_MODULES="$HTTP_MODULES ngx_http_auth_cookie_module"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_auth_cookie_module.c \
+                    $ngx_addon_dir/ngx_http_auth_cookie_util.c \
+                    $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \
+                    $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.c \
+                    $ngx_addon_dir/ngx_http_auth_cookie_page.c"
+    CORE_LIBS="$CORE_LIBS $CRYPT_LIB $NGX_OPENSSL_LIBS"
+fi
