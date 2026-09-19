@@ -25,8 +25,9 @@ ngx_int_t ngx_http_auth_cookie_load_page(ngx_pool_t *pool, ngx_log_t *log,
     ngx_str_t *path, ngx_str_t *content);
 
 /*
- * 渲染登录页:tpl 为模板(内置或外部文件),依次替换 title/error/next/action
- * 占位符(均做 HTML 转义)。返回 NGX_OK 时 *page 指向最终页面(pool 内存)。
+ * 渲染登录页:单遍扫描 tpl(内置或外部文件),替换 title/error/next/action
+ * 占位符(均做 HTML 转义)。替换值不会被再次扫描,其中文本不会被当作
+ * 占位符解释。返回 NGX_OK 时 *page 指向最终页面(pool 内存)。
  */
 ngx_int_t ngx_http_auth_cookie_page_render(ngx_pool_t *pool, ngx_str_t *tpl,
     ngx_str_t *title, ngx_str_t *error, ngx_str_t *next, ngx_str_t *action,

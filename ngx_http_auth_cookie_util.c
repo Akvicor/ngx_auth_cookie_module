@@ -251,34 +251,55 @@ ngx_http_auth_cookie_unescape(ngx_pool_t *pool, ngx_str_t *in, ngx_str_t *out)
 }
 
 
+/*
+ * 校验 next 参数,防开放重定向。
+ * next 全程保持 URI 编码形态:校验在解码副本上进行,输出保持编码值,
+ * 使登录后回跳目标与原始请求的编码语义一致(%23/%3F/%25 等不变形)。
+ * 允许站内相对路径(解码后以单个 / 开头,非 //)或同 host 绝对 URL。
+ * 非法时置 next->len = 0。
+ */
 void
 ngx_http_auth_cookie_sanitize_next(ngx_http_request_t *r, ngx_str_t *next)
 {
-    ngx_str_t   authority, request_host;
-    u_char     *p, *last, *path;
+    ngx_str_t   decoded, authority, request_host;
+    u_char     *p, *last, *dpath;
     size_t      scheme_len;
 
     if (next->len == 0) {
         return;
     }
 
-    /* Location 不接受控制字符、空格或反斜杠。 */
-    for (p = next->data; p < next->data + next->len; p++) {
+    /* 编码原文中的裸 '#' 会在 Location 中成为 fragment 分隔符,拒绝;
+       合法编码 %23 不受影响。 */
+    if (ngx_strlchr(next->data, next->data + next->len, '#') != NULL) {
+        next->len = 0;
+        return;
+    }
+
+    if (ngx_http_auth_cookie_unescape(r->pool, next, &decoded) != NGX_OK) {
+        next->len = 0;
+        return;
+    }
+
+    /* 解码副本不允许控制字符、空格或反斜杠。 */
+    for (p = decoded.data; p < decoded.data + decoded.len; p++) {
         if (*p <= 0x20 || *p == 0x7f || *p == '\\') {
             next->len = 0;
             return;
         }
     }
 
-    /* 相对路径:以单个 / 开头(拒绝 //) */
+    /* 相对路径(编码形态以 / 开头):解码副本须以单个 / 开头;输出编码原文。 */
     if (next->data[0] == '/') {
-        if (next->len >= 2 && next->data[1] == '/') {
+        if (decoded.len == 0 || decoded.data[0] != '/'
+            || (decoded.len >= 2 && decoded.data[1] == '/'))
+        {
             next->len = 0;
         }
         return;
     }
 
-    /* 绝对 URL:仅允许 http(s) 且 authority 与请求 Host 完全一致。 */
+    /* 绝对 URL:编码形态必须以字面 http(s):// 开头,authority 与 Host 一致。 */
     if (next->len >= sizeof("https://") - 1
         && ngx_strncasecmp(next->data, (u_char *) "https://",
                            sizeof("https://") - 1) == 0)
@@ -294,13 +315,13 @@ ngx_http_auth_cookie_sanitize_next(ngx_http_request_t *r, ngx_str_t *next)
         return;
     }
 
-    p = next->data + scheme_len;
-    last = next->data + next->len;
-    path = ngx_strlchr(p, last, '/');
+    p = decoded.data + scheme_len;
+    last = decoded.data + decoded.len;
+    dpath = ngx_strlchr(p, last, '/');
 
     authority.data = p;
-    authority.len = (path == NULL) ? (size_t) (last - p)
-                                   : (size_t) (path - p);
+    authority.len = (dpath == NULL) ? (size_t) (last - p)
+                                    : (size_t) (dpath - p);
 
     if (r->headers_in.host != NULL) {
         request_host = r->headers_in.host->value;
@@ -316,11 +337,26 @@ ngx_http_auth_cookie_sanitize_next(ngx_http_request_t *r, ngx_str_t *next)
         return;
     }
 
-    if (path == NULL) {
+    if (dpath == NULL) {
         next->data = (u_char *) "/";
         next->len = 1;
-    } else {
-        next->data = path;
-        next->len = last - path;
+        return;
     }
+
+    /* 转换后的 path 也必须以单个 / 开头,防止 // 形成协议相对重定向。 */
+    if (dpath + 1 < last && dpath[1] == '/') {
+        next->len = 0;
+        return;
+    }
+
+    /* 输出编码原文的 path 及之后部分,保留其中的 %XX 编码。 */
+    p = ngx_strlchr(next->data + scheme_len, next->data + next->len, '/');
+    if (p == NULL) {
+        next->data = (u_char *) "/";
+        next->len = 1;
+        return;
+    }
+
+    next->len = (next->data + next->len) - p;
+    next->data = p;
 }

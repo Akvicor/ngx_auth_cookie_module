@@ -14,12 +14,13 @@ if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_auth_cookie_module
     ngx_module_incs=
-    ngx_module_deps=
+    ngx_module_deps="$ngx_addon_dir/ngx_http_auth_cookie_rate_limit.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_auth_cookie_module.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_util.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.c \
-                     $ngx_addon_dir/ngx_http_auth_cookie_page.c"
+                     $ngx_addon_dir/ngx_http_auth_cookie_page.c \
+                     $ngx_addon_dir/ngx_http_auth_cookie_rate_limit.c"
     . auto/module
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_auth_cookie_module"
@@ -27,6 +28,7 @@ else
                     $ngx_addon_dir/ngx_http_auth_cookie_util.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.c \
-                    $ngx_addon_dir/ngx_http_auth_cookie_page.c"
+                    $ngx_addon_dir/ngx_http_auth_cookie_page.c \
+                    $ngx_addon_dir/ngx_http_auth_cookie_rate_limit.c"
     CORE_LIBS="$CORE_LIBS $CRYPT_LIB $NGX_OPENSSL_LIBS"
 fi

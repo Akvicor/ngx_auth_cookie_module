@@ -38,6 +38,7 @@ ngx_int_t ngx_http_auth_cookie_unescape(ngx_pool_t *pool, ngx_str_t *in,
 /*
  * 校验 next 参数,防开放重定向:
  * 允许站内相对路径(以单个 / 开头,非 //)或同 host 绝对 URL。
+ * next 保持 URI 编码形态,校验在解码副本上进行,输出保持编码值。
  * 非法时置 next->len = 0。
  */
 void ngx_http_auth_cookie_sanitize_next(ngx_http_request_t *r, ngx_str_t *next);

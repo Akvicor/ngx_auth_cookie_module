@@ -239,114 +239,116 @@ ngx_http_auth_cookie_html_escape_write(ngx_str_t *value, u_char *dst)
     return dst;
 }
 
+/* 渲染占位符表项:token 文本、对应值与转义后长度 */
+typedef struct {
+    const u_char  *token;
+    size_t         token_len;
+    ngx_str_t     *value;
+    size_t         esc_len;
+} ngx_http_auth_cookie_token_t;
+
+
 /*
- * 在 src 中把所有 token 替换为转义后的 value,结果写入 pool 分配的新缓冲。
- * 返回 NGX_OK 时 *out 指向结果。
+ * 判断 pos 处是否命中某个占位符;命中返回表项,否则 NULL。
  */
-static ngx_int_t
-ngx_http_auth_cookie_page_replace(ngx_pool_t *pool, ngx_str_t *src,
-    const u_char *token, size_t token_len, ngx_str_t *value, ngx_str_t *out)
+static ngx_http_auth_cookie_token_t *
+ngx_http_auth_cookie_page_match(ngx_http_auth_cookie_token_t *tokens,
+    ngx_uint_t n, u_char *pos, u_char *last)
 {
-    u_char     *dst, *cur, *p;
-    size_t      count, total, value_esc_len;
+    ngx_uint_t  i;
 
-    /* 统计出现次数 */
-    count = 0;
-    cur = src->data;
-    while (cur + token_len <= src->data + src->len) {
-        if (ngx_memcmp(cur, token, token_len) == 0) {
-            count++;
-            cur += token_len;
-        } else {
-            cur++;
-        }
-    }
-
-    if (count == 0) {
-        *out = *src;
-        return NGX_OK;
-    }
-
-    if (value->len > NGX_AUTH_COOKIE_PAGE_MAX / 6) {
-        return NGX_ERROR;
-    }
-
-    value_esc_len = ngx_http_auth_cookie_html_escape_len(value);
-    total = src->len - count * token_len;
-    if (value_esc_len != 0
-        && count > (NGX_AUTH_COOKIE_PAGE_MAX - total) / value_esc_len)
-    {
-        return NGX_ERROR;
-    }
-    total += count * value_esc_len;
-
-    if (total > NGX_AUTH_COOKIE_PAGE_MAX) {
-        return NGX_ERROR;
-    }
-
-    dst = ngx_pnalloc(pool, total);
-    if (dst == NULL) {
-        return NGX_ERROR;
-    }
-
-    cur = src->data;
-    p = dst;
-    while (cur < src->data + src->len) {
-        if (cur + token_len <= src->data + src->len
-            && ngx_strncmp(cur, token, token_len) == 0)
+    for (i = 0; i < n; i++) {
+        if ((size_t) (last - pos) >= tokens[i].token_len
+            && ngx_memcmp(pos, tokens[i].token, tokens[i].token_len) == 0)
         {
-            p = ngx_http_auth_cookie_html_escape_write(value, p);
-            cur += token_len;
-        } else {
-            *p++ = *cur++;
+            return &tokens[i];
         }
     }
 
-    out->data = dst;
-    out->len = p - dst;
-    return NGX_OK;
+    return NULL;
 }
 
+
 /*
- * 渲染登录页:tpl 为模板(内置或外部文件),依次替换 title/error/next/action。
- * 返回 NGX_OK 时 *page 指向最终页面。
+ * 渲染登录页:单遍扫描模板,把 {{title}}/{{error}}/{{action}}/{{next}}
+ * 占位符替换为 HTML 转义后的值。替换值写完后不再回扫,其内容不会被
+ * 当作占位符解释。返回 NGX_OK 时 *page 指向 pool 分配的最终页面。
  */
 ngx_int_t
 ngx_http_auth_cookie_page_render(ngx_pool_t *pool, ngx_str_t *tpl,
     ngx_str_t *title, ngx_str_t *error, ngx_str_t *next, ngx_str_t *action,
     ngx_str_t *page)
 {
-    ngx_str_t   stage;
-    ngx_int_t   rc;
+    ngx_http_auth_cookie_token_t   tokens[4], *t;
+    u_char                        *dst, *cur, *last, *p;
+    size_t                         total, i;
 
-    stage = *tpl;
+    tokens[0].token = (u_char *) "{{title}}";
+    tokens[0].token_len = sizeof("{{title}}") - 1;
+    tokens[0].value = title;
 
-    rc = ngx_http_auth_cookie_page_replace(pool, &stage,
-              (u_char *) "{{title}}", sizeof("{{title}}") - 1, title, &stage);
-    if (rc != NGX_OK) {
-        return rc;
+    tokens[1].token = (u_char *) "{{error}}";
+    tokens[1].token_len = sizeof("{{error}}") - 1;
+    tokens[1].value = error;
+
+    tokens[2].token = (u_char *) "{{action}}";
+    tokens[2].token_len = sizeof("{{action}}") - 1;
+    tokens[2].value = action;
+
+    tokens[3].token = (u_char *) "{{next}}";
+    tokens[3].token_len = sizeof("{{next}}") - 1;
+    tokens[3].value = next;
+
+    /* 单个替换值的长度上限,与旧实现保持一致。 */
+    for (i = 0; i < 4; i++) {
+        if (tokens[i].value->len > NGX_AUTH_COOKIE_PAGE_MAX / 6) {
+            return NGX_ERROR;
+        }
+        tokens[i].esc_len =
+            ngx_http_auth_cookie_html_escape_len(tokens[i].value);
     }
 
-    rc = ngx_http_auth_cookie_page_replace(pool, &stage,
-              (u_char *) "{{error}}", sizeof("{{error}}") - 1, error, &stage);
-    if (rc != NGX_OK) {
-        return rc;
+    /* 第一遍:计算转义后总长度 */
+    total = 0;
+    cur = tpl->data;
+    last = tpl->data + tpl->len;
+    while (cur < last) {
+        t = ngx_http_auth_cookie_page_match(tokens, 4, cur, last);
+        if (t != NULL) {
+            if (t->esc_len > NGX_AUTH_COOKIE_PAGE_MAX - total) {
+                return NGX_ERROR;
+            }
+            total += t->esc_len;
+            cur += t->token_len;
+        } else {
+            total++;
+            cur++;
+        }
+
+        if (total > NGX_AUTH_COOKIE_PAGE_MAX) {
+            return NGX_ERROR;
+        }
     }
 
-    rc = ngx_http_auth_cookie_page_replace(pool, &stage,
-              (u_char *) "{{action}}", sizeof("{{action}}") - 1, action,
-              &stage);
-    if (rc != NGX_OK) {
-        return rc;
+    /* 第二遍:单次分配并写入 */
+    dst = ngx_pnalloc(pool, total);
+    if (dst == NULL) {
+        return NGX_ERROR;
     }
 
-    /* 用户可控的 next 最后替换,避免其内容被当作其他 token 再解释。 */
-    rc = ngx_http_auth_cookie_page_replace(pool, &stage,
-              (u_char *) "{{next}}", sizeof("{{next}}") - 1, next, &stage);
-    if (rc != NGX_OK) {
-        return rc;
+    p = dst;
+    cur = tpl->data;
+    while (cur < last) {
+        t = ngx_http_auth_cookie_page_match(tokens, 4, cur, last);
+        if (t != NULL) {
+            p = ngx_http_auth_cookie_html_escape_write(t->value, p);
+            cur += t->token_len;
+        } else {
+            *p++ = *cur++;
+        }
     }
 
-    *page = stage;
+    page->data = dst;
+    page->len = p - dst;
     return NGX_OK;
 }
