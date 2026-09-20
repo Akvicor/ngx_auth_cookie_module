@@ -1,5 +1,10 @@
 # ngx_http_auth_cookie_module
 
+[中文文档](README.md)
+
+[Blog](https://www.ksyaki.com/archives/nginx-cookiedeng-lu-ren-zheng-cha-jian)
+
+
 `ngx_http_auth_cookie_module` provides nginx with session authentication based on HMAC-signed cookies.
 
 ## Build

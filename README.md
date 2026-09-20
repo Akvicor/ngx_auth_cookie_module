@@ -1,5 +1,9 @@
 # ngx_http_auth_cookie_module
 
+[README-EN](README-en_US.md)
+
+[博客链接](https://www.ksyaki.com/archives/nginx-cookiedeng-lu-ren-zheng-cha-jian)
+
 `ngx_http_auth_cookie_module` 为 nginx 提供基于 HMAC 签名 Cookie 的会话认证。
 
 ## 构建
