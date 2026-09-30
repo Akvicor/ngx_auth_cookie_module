@@ -61,10 +61,16 @@ server {
 | `auth_cookie_login_rate <IP capacity> <IP period> <IP+username capacity> <IP+username period> \| off` | `10 1000ms 1 1000ms` | Login POST IP bucket and IP+username bucket parameters; `off` disables all limiting |
 | `auth_cookie_login_rate_key <ip\|username\|ip_username>` | `ip_username` | Login rate limit key; `ip_username` checks the IP bucket before the IP+username bucket |
 | `auth_cookie_login_rate_zone_size <size>` | `1m` | Size of each login rate limit shared memory zone; only valid at `http` level |
-| `auth_cookie_login_rate_trusted_proxy <IP or CIDR...>` | Empty | Trusted proxies; supports multiple values and repeated directives |
+| `auth_cookie_login_rate_trusted_proxy <IP or CIDR or unix:...>` | Empty | Trusted proxies; supports multiple values and repeated directives |
 | `auth_cookie_login_rate_ip_header <header...>` | Not set | Ordered IP headers; supports multiple values and repeated directives |
 
 `auth_cookie_secret` is read while the configuration is loaded. If the file does not exist, a random 256-bit secret is generated and written with `0600` permissions, so `nginx -t` may also create this file. An existing file must be a regular file, contain at least 32 bytes, and grant no permissions to group or other users.
+
+The htpasswd, secret, and custom page files support symbolic links, including
+Kubernetes Secret/ConfigMap mounts. Secret ownership, permission, and size checks
+apply to the target. Directories containing the secret or traversed by its link
+path should be writable only by the nginx master user (root for a root-started
+master). Mounted targets must also meet the secret permission requirements.
 
 ### Location-Level Configuration
 
@@ -99,19 +105,48 @@ never re-interpreted as a placeholder.
 The cookie format is:
 
 ```text
-base64url(user:exp:nonce).hex(OpenSSL HMAC-SHA256(secret, host + user_file + payload))
+base64url(user:exp:nonce).hex(OpenSSL HMAC-SHA256(secret, host + user_file + fingerprint + payload))
 ```
 
 The signature is bound to the request host and user file, preventing cookies from other virtual hosts or authentication domains from being replayed. `next` accepts only site-local absolute paths or HTTP(S) URLs whose authority matches the current Host, and rejects control characters, backslashes, and protocol-relative URLs.
 
+Redirect output preserves the original URI encoding, including `+` and `%20`.
+Absolute URLs containing percent encoding in the authority are rejected. Form
+fields are limited to 4096 bytes before decoding. Depending on encoding expansion,
+complex original URLs longer than approximately 2.7KB may fall back to `/` (a
+2505-byte URI worked in testing, while a 3005-byte URI fell back). This is not a
+universal length cutoff for every URL.
+
 Sessions are stateless on the server, allowing multiple workers to verify
 signatures directly. The htpasswd file is loaded into memory while the
 configuration is loaded; file changes take effect after a `reload` or restart.
-Every server/location that enables authentication loads the file on its own,
-including locations that inherit the same file. Issued sessions are bound to a
+Each file purpose and path is loaded once per configuration cycle and shared by
+server/location configurations; a reload reads new snapshots. Issued sessions are bound to a
 fingerprint of the current user's password hash, so deleting a user or changing
 their password invalidates old sessions after a reload. Logging out clears the
 browser cookie. Production deployments should use HTTPS.
+
+HTTPS sites should use `auth_cookie_name __Host-auth_cookie;`. Browsers require
+`__Host-` cookies to have `Secure`, `Path=/`, and host-only scope, preventing sibling
+subdomains from injecting or shadowing them. The `__Host-` and `__Secure-` prefixes
+(case-insensitive) require `auth_cookie_secure on`; incompatible configurations
+are rejected. The default name remains `auth_cookie`.
+
+Unknown usernames and wrong passwords produce identical pages, messages, and
+status codes, but different response times. Treat usernames as public identifiers;
+authentication security relies on rate limiting and strong passwords.
+
+After login, password copies and the original in-memory request body are cleared
+on a best-effort basis. TLS, HTTP/2, and other internal buffers may retain plaintext.
+Keep `client_body_in_file_only off` for login locations. Core dumps may contain
+recent plaintext passwords, so restrict their creation and distribution.
+
+Login/logout POST bodies are limited to 8KB, excluding headers and independently
+of protected application uploads. Requests with a body require `Content-Length`;
+chunked requests and HTTP/2 or HTTP/3 bodies without a length receive 411. Declared
+lengths above 8KB receive 413. Bodyless POSTs may omit the length: logout returns
+302 and empty login returns 400, matching `Content-Length: 0`. The module limit
+is independent of the application's `client_max_body_size`.
 
 ## Login Rate Limiting
 
@@ -136,12 +171,25 @@ IP + username bucket with the last two parameters. Login POST requests without a
 valid username fall back to the source IP key. Token accounting uses integer
 arithmetic only.
 
+IPv4 is counted per address, IPv6 per /64 prefix, and IPv4-mapped addresses are
+normalized to IPv4. Users in one /64 share the source allowance. Distributed
+attempts against one account retain separate allowances per source; use strong
+passwords and, for large public-facing attacks, combine with CDN/WAF protection
+or log-based blocking tools such as fail2ban.
+
 Trusted proxies are declared with `auth_cookie_login_rate_trusted_proxy`. The
 default `auto` mode parses `X-Forwarded-For` and `X-Real-IP` only when the direct
 connection comes from a trusted proxy; otherwise it uses `$remote_addr`.
 `X-Forwarded-For` is evaluated from right to left, selecting the first untrusted
 address. Without a trusted proxy, those headers do not participate in the rate
 limit key.
+
+For traffic forwarded over unix sockets, configure
+`auth_cookie_login_rate_trusted_proxy unix:;` and have the trusted frontend supply
+real client IP headers, or use realip's `set_real_ip_from unix:` with
+`real_ip_header`. `unix:` trusts all direct unix socket sources, so socket
+permissions should restrict who can connect. Without real client IP resolution,
+unix socket requests share one rate limit bucket.
 
 To use CDN-specific headers, configure one or more headers explicitly. The module
 uses the first valid IPv4/IPv6 address in the configured order. Explicit mode
@@ -171,8 +219,9 @@ reset the overall IP limit. A reload with the same zone size preserves state;
 changing the size or restarting nginx clears it. State is not shared across
 multiple nginx instances.
 
-User lookup is a linear scan; the module targets small-scale authentication
-with tens of users.
+Loading deduplication and request lookups share a case-sensitive string red-black
+tree index. Duplicate usernames keep the first entry. The module targets
+small-scale authentication with tens of users.
 
 Login and logout URIs run after same-level access controls: `satisfy`,
 `allow`/`deny`, `auth_basic`, and `auth_request` constrain the login entry
@@ -191,6 +240,10 @@ The `$auth_cookie_user` variable contains the currently authenticated username a
 log_format auth '$remote_addr user=$auth_cookie_user "$request" $status';
 ```
 
+The variable retains the last successfully verified username for this request,
+including logs after internal redirects to public locations. Each protected
+destination location still verifies the cookie independently.
+
 ## htpasswd
 
 The user file is limited to 1 MiB and supports:
@@ -203,6 +256,13 @@ bcrypt is recommended:
 ```sh
 htpasswd -B /etc/nginx/htpasswd alice
 ```
+
+Password hashing is synchronous in the worker, blocking its other connections
+until completion. Costs vary by hardware; local measurements were approximately
+1.4ms at bcrypt cost 5, 39ms at cost 10, and 156ms at cost 12. A cost no greater
+than 10 is recommended. Higher costs generate a warning once per loaded user file
+snapshot without rejecting startup or authentication. Login rate limiting is the
+main control for hashing load.
 
 ## Verification
 

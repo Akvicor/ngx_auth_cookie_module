@@ -98,7 +98,7 @@ ngx_http_auth_cookie_load_secret(ngx_pool_t *pool, ngx_log_t *log,
     }
 
     fd = ngx_open_file(secret_file->data,
-                       NGX_FILE_RDONLY|NGX_FILE_NONBLOCK|O_NOFOLLOW,
+                       NGX_FILE_RDONLY|NGX_FILE_NONBLOCK,
                        NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) {
         ngx_err_t  err = ngx_errno;
@@ -133,7 +133,7 @@ ngx_http_auth_cookie_load_secret(ngx_pool_t *pool, ngx_log_t *log,
             if (ngx_errno == NGX_EEXIST) {
                 ngx_explicit_memzero(secret->data, secret_len);
                 fd = ngx_open_file(secret_file->data,
-                                   NGX_FILE_RDONLY|NGX_FILE_NONBLOCK|O_NOFOLLOW,
+                                   NGX_FILE_RDONLY|NGX_FILE_NONBLOCK,
                                    NGX_FILE_OPEN, 0);
                 if (fd != NGX_INVALID_FILE) {
                     goto read_existing;
@@ -326,8 +326,8 @@ ngx_http_auth_cookie_sign(ngx_http_request_t *r,
 
 
 ngx_int_t
-ngx_http_auth_cookie_peek_user(ngx_http_request_t *r, ngx_str_t *cookie_str,
-    ngx_str_t *user)
+ngx_http_auth_cookie_parse(ngx_http_request_t *r, ngx_str_t *cookie_str,
+    ngx_http_auth_cookie_session_t *session)
 {
     u_char     *dot, *colon, *nonce_sep;
     ngx_str_t   payload, raw, nonce_hex;
@@ -364,9 +364,11 @@ ngx_http_auth_cookie_peek_user(ngx_http_request_t *r, ngx_str_t *cookie_str,
         return NGX_DECLINED;
     }
 
-    user->data = raw.data;
-    user->len = colon - raw.data;
-    if (user->len == 0 || user->len > NGX_AUTH_COOKIE_MAX_USER_LEN) {
+    session->user.data = raw.data;
+    session->user.len = colon - raw.data;
+    if (session->user.len == 0
+        || session->user.len > NGX_AUTH_COOKIE_MAX_USER_LEN)
+    {
         return NGX_DECLINED;
     }
 
@@ -384,6 +386,16 @@ ngx_http_auth_cookie_peek_user(ngx_http_request_t *r, ngx_str_t *cookie_str,
         return NGX_DECLINED;
     }
 
+    if (ngx_http_auth_cookie_hex2bin(dot + 1, NGX_AUTH_COOKIE_SIG_LEN * 2,
+                                    session->signature)
+        != NGX_OK)
+    {
+        return NGX_DECLINED;
+    }
+
+    session->payload = payload;
+    session->expiry.data = colon + 1;
+    session->expiry.len = nonce_sep - (colon + 1);
     return NGX_OK;
 }
 
@@ -391,92 +403,30 @@ ngx_http_auth_cookie_peek_user(ngx_http_request_t *r, ngx_str_t *cookie_str,
 ngx_int_t
 ngx_http_auth_cookie_verify(ngx_http_request_t *r,
     ngx_str_t *secret, ngx_str_t *audience, const u_char *fingerprint,
-    ngx_str_t *cookie_str, ngx_str_t *user)
+    ngx_http_auth_cookie_session_t *session)
 {
-    u_char     *dot, *colon, *nonce_sep;
-    ngx_str_t   payload, sig_hex, raw, exp_str, nonce_hex;
-    u_char      expect_sig[NGX_AUTH_COOKIE_HMAC_SHA256_LEN];
-    u_char      got_sig[NGX_AUTH_COOKIE_HMAC_SHA256_LEN];
-    u_char      nonce[16];
-    time_t      exp, now;
+    u_char expect_sig[NGX_AUTH_COOKIE_HMAC_SHA256_LEN];
+    time_t exp, now;
 
-    if (secret->len == 0 || cookie_str->len == 0) {
-        return NGX_DECLINED;
-    }
-
-    /* 拆 payload.sig */
-    dot = ngx_strlchr(cookie_str->data, cookie_str->data + cookie_str->len,
-                      '.');
-    if (dot == NULL) {
-        return NGX_DECLINED;
-    }
-
-    payload.data = cookie_str->data;
-    payload.len = dot - cookie_str->data;
-
-    sig_hex.data = dot + 1;
-    sig_hex.len = cookie_str->data + cookie_str->len - (dot + 1);
-
-    if (payload.len == 0 || sig_hex.len != NGX_AUTH_COOKIE_SIG_LEN * 2) {
-        return NGX_DECLINED;
-    }
-
-    if (ngx_http_auth_cookie_hex2bin(sig_hex.data, sig_hex.len, got_sig)
-        != NGX_OK)
-    {
-        return NGX_DECLINED;
-    }
-
-    if (ngx_http_auth_cookie_b64url_decode(r->pool, payload.data,
-                                           payload.len, &raw)
-        != NGX_OK)
-    {
-        return NGX_DECLINED;
-    }
-
-    colon = ngx_strlchr(raw.data, raw.data + raw.len, ':');
-    if (colon == NULL) {
-        return NGX_DECLINED;
-    }
-
-    user->data = raw.data;
-    user->len = colon - raw.data;
-    if (user->len == 0 || user->len > NGX_AUTH_COOKIE_MAX_USER_LEN) {
-        return NGX_DECLINED;
-    }
-
-    nonce_sep = ngx_strlchr(colon + 1, raw.data + raw.len, ':');
-    if (nonce_sep == NULL) {
-        return NGX_DECLINED;
-    }
-
-    exp_str.data = colon + 1;
-    exp_str.len = nonce_sep - (colon + 1);
-
-    nonce_hex.data = nonce_sep + 1;
-    nonce_hex.len = raw.data + raw.len - (nonce_sep + 1);
-    if (nonce_hex.len != sizeof(nonce) * 2
-        || ngx_http_auth_cookie_hex2bin(nonce_hex.data, nonce_hex.len, nonce)
-           != NGX_OK)
-    {
+    if (secret->len == 0) {
         return NGX_DECLINED;
     }
 
     if (ngx_http_auth_cookie_session_hmac(r, secret, audience, fingerprint,
-                                          &payload, expect_sig)
+                                          &session->payload, expect_sig)
         != NGX_OK)
     {
         return NGX_DECLINED;
     }
 
-    if (ngx_http_auth_cookie_constant_eq(got_sig, expect_sig,
+    if (ngx_http_auth_cookie_constant_eq(session->signature, expect_sig,
                                          NGX_AUTH_COOKIE_HMAC_SHA256_LEN)
         != NGX_OK)
     {
         return NGX_DECLINED;
     }
 
-    exp = ngx_atoi(exp_str.data, exp_str.len);
+    exp = ngx_atoi(session->expiry.data, session->expiry.len);
     if (exp == NGX_ERROR) {
         return NGX_DECLINED;
     }

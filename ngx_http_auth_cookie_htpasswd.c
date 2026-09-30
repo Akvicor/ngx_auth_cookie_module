@@ -50,7 +50,7 @@ ngx_http_auth_cookie_user_fingerprint(ngx_str_t *hash, u_char *out)
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_auth_cookie_check_password(ngx_http_request_t *r,
     ngx_str_t *passwd, ngx_str_t *hash)
 {
@@ -103,46 +103,21 @@ ngx_http_auth_cookie_check_password(ngx_http_request_t *r,
 
 
 ngx_http_auth_cookie_user_t *
-ngx_http_auth_cookie_find_user(ngx_array_t *users, ngx_str_t *name)
+ngx_http_auth_cookie_lookup_user(ngx_http_auth_cookie_users_t *users,
+    ngx_str_t *name)
 {
-    ngx_http_auth_cookie_user_t  *user;
-    ngx_uint_t                    i;
-
     if (users == NULL || name->len == 0) {
         return NULL;
     }
 
-    user = users->elts;
-    for (i = 0; i < users->nelts; i++) {
-        if (user[i].name.len == name->len
-            && ngx_strncmp(user[i].name.data, name->data, name->len) == 0)
-        {
-            return &user[i];
-        }
-    }
-
-    return NULL;
-}
-
-
-ngx_int_t
-ngx_http_auth_cookie_check_user(ngx_http_request_t *r,
-    ngx_array_t *users, ngx_str_t *user, ngx_str_t *passwd)
-{
-    ngx_http_auth_cookie_user_t  *entry;
-
-    entry = ngx_http_auth_cookie_find_user(users, user);
-    if (entry == NULL) {
-        return NGX_DECLINED;
-    }
-
-    return ngx_http_auth_cookie_check_password(r, passwd, &entry->hash);
+    return (ngx_http_auth_cookie_user_t *) ngx_str_rbtree_lookup(&users->tree,
+                               name, ngx_crc32_short(name->data, name->len));
 }
 
 
 ngx_int_t
 ngx_http_auth_cookie_load_users(ngx_pool_t *pool, ngx_log_t *log,
-    ngx_str_t *user_file, ngx_array_t **users)
+    ngx_str_t *user_file, ngx_http_auth_cookie_users_t **users)
 {
     ngx_fd_t                      fd;
     ngx_file_t                    file;
@@ -150,12 +125,13 @@ ngx_http_auth_cookie_load_users(ngx_pool_t *pool, ngx_log_t *log,
     ssize_t                       n;
     size_t                        size, i, line_start, name_len, hash_off;
     u_char                       *buf, *p, *line_end;
-    ngx_array_t                  *table;
+    ngx_http_auth_cookie_users_t *table;
     ngx_http_auth_cookie_user_t  *entry;
     ngx_str_t                     name, hash;
+    ngx_int_t                     cost;
 
     fd = ngx_open_file(user_file->data,
-                       NGX_FILE_RDONLY|NGX_FILE_NONBLOCK|O_NOFOLLOW,
+                       NGX_FILE_RDONLY|NGX_FILE_NONBLOCK,
                        NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) {
         ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
@@ -196,10 +172,13 @@ ngx_http_auth_cookie_load_users(ngx_pool_t *pool, ngx_log_t *log,
     }
     buf[size] = '\0';
 
-    table = ngx_array_create(pool, 8, sizeof(ngx_http_auth_cookie_user_t));
+    table = ngx_pcalloc(pool, sizeof(*table));
     if (table == NULL) {
         return NGX_ERROR;
     }
+
+    ngx_rbtree_init(&table->tree, &table->sentinel,
+                   ngx_str_rbtree_insert_value);
 
     i = 0;
     while (i < size) {
@@ -258,16 +237,17 @@ ngx_http_auth_cookie_load_users(ngx_pool_t *pool, ngx_log_t *log,
             return NGX_ERROR;
         }
 
-        if (ngx_http_auth_cookie_find_user(table, &name) != NULL) {
+        if (ngx_http_auth_cookie_lookup_user(table, &name) != NULL) {
             continue;
         }
 
-        entry = ngx_array_push(table);
+        entry = ngx_pcalloc(pool, sizeof(*entry));
         if (entry == NULL) {
             return NGX_ERROR;
         }
 
-        entry->name = name;
+        entry->node.str = name;
+        entry->node.node.key = ngx_crc32_short(name.data, name.len);
         entry->hash = hash;
         if (ngx_http_auth_cookie_user_fingerprint(&hash, entry->fingerprint)
             != NGX_OK)
@@ -276,6 +256,19 @@ ngx_http_auth_cookie_load_users(ngx_pool_t *pool, ngx_log_t *log,
                           "auth_cookie: hash fingerprint failed in \"%s\"",
                           user_file->data);
             return NGX_ERROR;
+        }
+
+        ngx_rbtree_insert(&table->tree, &entry->node.node);
+
+        /* 高 cost 会阻塞 worker，只告警，让管理员按服务负载选择代价。 */
+        if (hash.len >= 7 && hash.data[1] == '2' && hash.data[6] == '$') {
+            cost = ngx_atoi(hash.data + 4, 2);
+            if (cost > 10) {
+                ngx_log_error(NGX_LOG_WARN, log, 0,
+                              "auth_cookie: user file \"%V\", user \"%V\": "
+                              "bcrypt cost %i exceeds 10 and blocks the worker",
+                              user_file, &name, cost);
+            }
         }
     }
 

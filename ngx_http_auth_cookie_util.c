@@ -269,11 +269,12 @@ ngx_http_auth_cookie_sanitize_next(ngx_http_request_t *r, ngx_str_t *next)
         return;
     }
 
-    /* 编码原文中的裸 '#' 会在 Location 中成为 fragment 分隔符,拒绝;
-       合法编码 %23 不受影响。 */
-    if (ngx_strlchr(next->data, next->data + next->len, '#') != NULL) {
-        next->len = 0;
-        return;
+    /* 原文直接用于 Location，避免浏览器剥离字符、改写斜杠或添加 fragment。 */
+    for (p = next->data; p < next->data + next->len; p++) {
+        if (*p <= 0x20 || *p == 0x7f || *p == '\\' || *p == '#') {
+            next->len = 0;
+            return;
+        }
     }
 
     if (ngx_http_auth_cookie_unescape(r->pool, next, &decoded) != NGX_OK) {
@@ -281,9 +282,9 @@ ngx_http_auth_cookie_sanitize_next(ngx_http_request_t *r, ngx_str_t *next)
         return;
     }
 
-    /* 解码副本不允许控制字符、空格或反斜杠。 */
+    /* 编码空格与加号保持原文输出；副本仍拒绝控制字符与反斜杠。 */
     for (p = decoded.data; p < decoded.data + decoded.len; p++) {
-        if (*p <= 0x20 || *p == 0x7f || *p == '\\') {
+        if (*p < 0x20 || *p == 0x7f || *p == '\\') {
             next->len = 0;
             return;
         }
@@ -313,6 +314,16 @@ ngx_http_auth_cookie_sanitize_next(ngx_http_request_t *r, ngx_str_t *next)
     } else {
         next->len = 0;
         return;
+    }
+
+    /* authority 无百分号编码时，原文与副本定位的 path 起点才一致。 */
+    p = next->data + scheme_len;
+    last = next->data + next->len;
+    for (; p < last && *p != '/'; p++) {
+        if (*p == '%') {
+            next->len = 0;
+            return;
+        }
     }
 
     p = decoded.data + scheme_len;

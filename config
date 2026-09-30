@@ -14,8 +14,15 @@ if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_auth_cookie_module
     ngx_module_incs=
-    ngx_module_deps="$ngx_addon_dir/ngx_http_auth_cookie_rate_limit.h"
+    ngx_module_deps="$ngx_addon_dir/ngx_http_auth_cookie_module.h \
+                     $ngx_addon_dir/ngx_http_auth_cookie_file_cache.h \
+                     $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.h \
+                     $ngx_addon_dir/ngx_http_auth_cookie_crypto.h \
+                     $ngx_addon_dir/ngx_http_auth_cookie_util.h \
+                     $ngx_addon_dir/ngx_http_auth_cookie_page.h \
+                     $ngx_addon_dir/ngx_http_auth_cookie_rate_limit.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_auth_cookie_module.c \
+                     $ngx_addon_dir/ngx_http_auth_cookie_file_cache.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_util.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.c \
@@ -25,6 +32,7 @@ if test -n "$ngx_module_link"; then
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_auth_cookie_module"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_auth_cookie_module.c \
+                    $ngx_addon_dir/ngx_http_auth_cookie_file_cache.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_util.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.c \

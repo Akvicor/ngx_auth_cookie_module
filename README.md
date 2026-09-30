@@ -60,10 +60,15 @@ server {
 | `auth_cookie_login_rate <IP容量> <IP周期> <IP+用户名容量> <IP+用户名周期> \| off` | `10 1000ms 1 1000ms` | 登录 POST 的 IP 桶和 IP+用户名桶参数；`off` 关闭全部限流 |
 | `auth_cookie_login_rate_key <ip\|username\|ip_username>` | `ip_username` | 登录限流统计键；`ip_username` 先检查 IP 桶再检查 IP+用户名桶 |
 | `auth_cookie_login_rate_zone_size <size>` | `1m` | 每个登录限流共享内存区的容量，只能在 `http` 层级配置 |
-| `auth_cookie_login_rate_trusted_proxy <IP或CIDR...>` | 空 | 可信代理，可多行或多值配置 |
+| `auth_cookie_login_rate_trusted_proxy <IP或CIDR或unix:...>` | 空 | 可信代理，可多行或多值配置 |
 | `auth_cookie_login_rate_ip_header <header...>` | 未设置 | 显式 IP Header 顺序，可多行或多值配置 |
 
 `auth_cookie_secret` 在配置加载阶段读取。文件不存在时会生成 256 位随机密钥并以 `0600` 写入，因此 `nginx -t` 也可能创建该文件。已有文件须为普通文件、至少 32 字节，且不能向 group/other 授权。
+
+htpasswd、secret 与自定义登录页支持符号链接，可用于 Kubernetes Secret/ConfigMap
+挂载。secret 的属主、权限与大小校验针对链接目标；secret 所在目录及链接路径上的目录
+应仅允许 nginx master 用户写入（以 root 启动时为 root）。挂载目标也须满足 secret 的
+权限要求。
 
 ### Location 级配置
 
@@ -97,16 +102,38 @@ server 级配置可直接使用默认 `/_login`。
 Cookie 格式为：
 
 ```text
-base64url(user:exp:nonce).hex(OpenSSL HMAC-SHA256(secret, host + user_file + payload))
+base64url(user:exp:nonce).hex(OpenSSL HMAC-SHA256(secret, host + user_file + fingerprint + payload))
 ```
 
 签名绑定请求 host 与用户文件，来自其他虚拟主机或认证域的 Cookie 无法重放。`next` 只接受站内绝对路径或 authority 与当前 Host 一致的 HTTP(S) URL，并拒绝控制字符、反斜杠和协议相对 URL。
 
+`next` 输出保持原始 URI 编码，`+` 与 `%20` 可正常回跳。绝对 URL 的 authority 段含
+百分号编码时拒绝。单个表单字段解码前上限为 4096 字节，回跳长度取决于 URL 的编码
+膨胀：复杂查询串的原始 URL 约超过 2.7KB 时可能回退到 `/`（实测 2505B 可回跳，3005B
+回退）；该阈值不是所有 URL 的统一长度上限。
+
 会话无服务端状态，多 worker 可直接验签。htpasswd 在配置加载时读入内存，
-文件修改在 `reload` 或重启后生效；每个启用认证的 server/location 配置
-在加载时各自读取文件（包括继承同一文件的 location）。
+文件修改在 `reload` 或重启后生效；同一用途、同一路径的文件在一次配置加载中只读取
+一次，server/location 共享该快照，reload 时重新读取。
 签发绑定当前用户密码哈希指纹，删除用户或改密并 reload 后旧会话失效。
 登出会清除浏览器 Cookie。生产环境应使用 HTTPS。
+
+HTTPS 站点推荐配置 `auth_cookie_name __Host-auth_cookie;`。浏览器要求 `__Host-`
+Cookie 带 `Secure`、`Path=/` 且为 host-only，因此同一注册域的其他子域名无法注入或遮蔽
+该 Cookie。`__Host-` 或 `__Secure-` 前缀（不区分大小写）须配合
+`auth_cookie_secure on`，否则配置检查失败；默认 Cookie 名仍为 `auth_cookie`。
+
+用户名不存在和密码错误返回相同页面、文案与状态码，但响应耗时不同。用户名按公开
+标识使用，认证安全依赖登录限流与强密码。
+
+登录后会清零模块的密码副本及原始内存请求体，清零是尽力而为：TLS、HTTP/2 等内部
+缓冲区仍可能残留明文。登录 location 应使用内存请求体，保持 `client_body_in_file_only off`；
+core dump 可能包含近期登录的明文密码，应限制生成与分发。
+
+登录/登出 POST 的请求体上限为 8KB（不含请求头，不影响受保护应用的上传）。有请求体时
+须带 `Content-Length`，chunked 或 HTTP/2、HTTP/3 有请求体却无长度时返回 411；明确长度
+超过 8KB 返回 413。无请求体可省略长度：登出正常 302，空登录与 `Content-Length: 0`
+一致返回 400。该上限独立于应用的 `client_max_body_size`。
 
 ## 登录限流
 
@@ -125,10 +152,19 @@ auth_cookie_login_rate_key ip_username;
 `ip_username` 模式先用前两参数检查 IP，再用后两参数检查来源 IP + 用户名。
 无法取得有效用户名的登录 POST 回退到来源 IP。令牌和恢复周期都使用整数计算，不使用浮点。
 
+IPv4 按单个地址计数，IPv6 按 /64 聚合；IPv4 映射地址归一为 IPv4。同一 /64 的用户
+共享来源额度。限流按来源统计，多个来源分散爆破同一账号仍有各自额度；安全依赖强密码。
+面向公网的大规模攻击场景可结合 CDN/WAF 或基于日志的封禁工具（如 fail2ban）。
+
 可信代理由 `auth_cookie_login_rate_trusted_proxy` 声明。默认 `auto` 模式只在直接
 连接来自可信代理时解析 `X-Forwarded-For` 和 `X-Real-IP`，否则使用 `$remote_addr`。
 `X-Forwarded-For` 按代理链从右向左取第一个不可信地址。未配置可信代理时，这些
 请求头不会参与限流键。
+
+经 unix socket 接收代理流量时，可配置 `auth_cookie_login_rate_trusted_proxy unix:;`
+并让可信前端提供真实 IP Header，或使用 realip 的 `set_real_ip_from unix:` 配合
+`real_ip_header`。`unix:` 信任所有 unix socket 直连来源，socket 权限应限制连接者。
+未配置真实 IP 来源时，unix socket 请求共用一个限流桶。
 
 需要按 CDN 特有 Header 识别客户端时，显式配置一个或多个 Header；模块按配置顺序
 取第一个合法 IPv4/IPv6。显式模式下必须配置至少一个可信代理；来源不可信或没有
@@ -154,7 +190,8 @@ auth_cookie_login_rate_zone_size 4m;
 未使用的条目，因此用户名轮换不会重置 IP 总限额。相同大小的 reload 保留限流状态；
 改变共享内存大小或完整 restart 后清空。限流状态不跨多个 Nginx 实例共享。
 
-用户查找为线性扫描，本模块面向几十个用户量级的小规模认证场景。
+用户加载去重和请求查找共用区分大小写的字符串红黑树索引；重复用户名以首条为准。
+本模块面向几十个用户量级的小规模认证场景。
 
 登录与登出 URI 在同层访问控制之后执行：`satisfy`、`allow`/`deny`、
 `auth_basic`、`auth_request` 等配置会先约束登录入口，
@@ -172,6 +209,9 @@ host:port 与请求 Host 一致（比较忽略 scheme，以兼容 TLS 终结代�
 log_format auth '$remote_addr user=$auth_cookie_user "$request" $status';
 ```
 
+该变量保留本次请求中最近一次验签通过的用户名，包括内部重定向到公开 location 后的
+日志；每个启用认证的目标 location 仍独立验签。
+
 ## htpasswd
 
 用户文件最大 1 MiB，支持：
@@ -184,6 +224,11 @@ log_format auth '$remote_addr user=$auth_cookie_user "$request" $status';
 ```sh
 htpasswd -B /etc/nginx/htpasswd alice
 ```
+
+密码哈希在 worker 中同步计算，期间同 worker 的其他连接等待。bcrypt cost 的耗时随
+机器变化，本机参考值为 cost 5 约 1.4ms、10 约 39ms、12 约 156ms。推荐 cost 不超过
+10；超过 10 时加载用户文件会告警，不影响启动或认证，且每个文件快照只告警一次。
+登录限流是控制计算负载的主要防线。
 
 ## 验证
 

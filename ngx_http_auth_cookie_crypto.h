@@ -3,7 +3,7 @@
  *
  * cookie 格式:
  *   payload = base64url(user ":" decimal(exp) ":" hex(nonce))
- *   sig     = hex(HMAC-SHA256(secret, host + audience + payload))
+ *   sig     = hex(HMAC-SHA256(secret, host + audience + fingerprint + payload))
  *   cookie  = payload "." sig
  *
  * secret 从文件读取;文件不存在时生成 256 位随机密钥写入(权限 0600)。
@@ -29,21 +29,22 @@ ngx_int_t ngx_http_auth_cookie_sign(ngx_http_request_t *r,
     ngx_str_t *secret, ngx_str_t *audience, const u_char *fingerprint,
     time_t session_ttl, ngx_str_t *user, ngx_str_t *cookie);
 
-/*
- * 验签 cookie。
- * 参数:
- *   secret      HMAC 密钥
- *   cookie_str  请求 cookie 值
- * 成功返回 NGX_OK, *user 指向 pool 分配的解出用户名;
- * 失败(无签名/签名错误/过期/非法)返回 NGX_DECLINED。
- */
+/* 解析结果尚未认证；仅在验签通过后用于请求身份。 */
+typedef struct {
+    ngx_str_t  payload;
+    ngx_str_t  user;
+    ngx_str_t  expiry;
+    u_char     signature[NGX_AUTH_COOKIE_SIG_LEN];
+} ngx_http_auth_cookie_session_t;
+
+/* 一次解析 Cookie 结构，用户名用于查找当前密码指纹。 */
+ngx_int_t ngx_http_auth_cookie_parse(ngx_http_request_t *r,
+    ngx_str_t *cookie, ngx_http_auth_cookie_session_t *session);
+
+/* 绑定当前用户指纹验签并校验过期；失败返回 NGX_DECLINED。 */
 ngx_int_t ngx_http_auth_cookie_verify(ngx_http_request_t *r,
     ngx_str_t *secret, ngx_str_t *audience, const u_char *fingerprint,
-    ngx_str_t *cookie_str, ngx_str_t *user);
-
-/* 从 cookie payload 解出用户名,不验签。失败返回 NGX_DECLINED。 */
-ngx_int_t ngx_http_auth_cookie_peek_user(ngx_http_request_t *r,
-    ngx_str_t *cookie_str, ngx_str_t *user);
+    ngx_http_auth_cookie_session_t *session);
 
 /* 从文件载入 secret;不存在则生成(0600)。结果使用传入 pool 的生命周期。 */
 ngx_int_t ngx_http_auth_cookie_load_secret(ngx_pool_t *pool, ngx_log_t *log,

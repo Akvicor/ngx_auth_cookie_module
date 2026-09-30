@@ -8,6 +8,7 @@
 #include <openssl/evp.h>
 
 #include "ngx_http_auth_cookie_rate_limit.h"
+#include "ngx_http_auth_cookie_module.h"
 
 #define NGX_AUTH_COOKIE_RATE_DEFAULT_ZONE_SIZE  (1024 * 1024)
 #define NGX_AUTH_COOKIE_RATE_MIN_ZONE_SIZE      (8 * ngx_pagesize)
@@ -254,6 +255,17 @@ ngx_http_auth_cookie_rate_list_set(ngx_conf_t *cf, ngx_array_t **list,
         }
 
         if (proxies) {
+#if (NGX_HAVE_UNIX_DOMAIN)
+            /* 与 realip 的 unix: 写法一致，表示信任本机 unix socket 来源。 */
+            if (value[i].len == sizeof("unix:") - 1
+                && ngx_strncmp(value[i].data, "unix:", sizeof("unix:") - 1) == 0)
+            {
+                entry = item;
+                ngx_memzero(entry, sizeof(*entry));
+                entry->family = AF_UNIX;
+                continue;
+            }
+#endif
             rc = ngx_ptocidr(&value[i], &cidr);
             if (rc == NGX_ERROR) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -622,7 +634,7 @@ ngx_http_auth_cookie_rate_key(ngx_http_request_t *r,
     ngx_http_auth_cookie_rate_loc_conf_t *conf, ngx_addr_t *addr,
     ngx_str_t *username, u_char *out)
 {
-    u_char       *message, *p;
+    u_char       *message, *p, *address;
     size_t        len, addr_len;
     uint32_t      family, user_len;
     unsigned int  out_len;
@@ -631,17 +643,29 @@ ngx_http_auth_cookie_rate_key(ngx_http_request_t *r,
     struct sockaddr_in6  *sin6;
 #endif
 
-    addr_len = 0;
+    family = (uint32_t) addr->sockaddr->sa_family;
     switch (addr->sockaddr->sa_family) {
     case AF_INET:
+        sin = (struct sockaddr_in *) addr->sockaddr;
+        address = (u_char *) &sin->sin_addr;
         addr_len = 4;
         break;
 #if (NGX_HAVE_INET6)
     case AF_INET6:
-        addr_len = 16;
+        sin6 = (struct sockaddr_in6 *) addr->sockaddr;
+        address = sin6->sin6_addr.s6_addr;
+        /* 映射地址归一，原生 IPv6 按 /64 聚合，限制同一来源轮换地址。 */
+        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+            family = AF_INET;
+            address += 12;
+            addr_len = 4;
+        } else {
+            addr_len = 8;
+        }
         break;
 #endif
     default:
+        address = r->connection->addr_text.data;
         addr_len = r->connection->addr_text.len;
         break;
     }
@@ -654,24 +678,8 @@ ngx_http_auth_cookie_rate_key(ngx_http_request_t *r,
     }
 
     p = ngx_cpymem(message, conf->scope, NGX_AUTH_COOKIE_RATE_KEY_LEN);
-    family = (uint32_t) addr->sockaddr->sa_family;
     p = ngx_cpymem(p, &family, 4);
-
-    switch (addr->sockaddr->sa_family) {
-    case AF_INET:
-        sin = (struct sockaddr_in *) addr->sockaddr;
-        p = ngx_cpymem(p, &sin->sin_addr, 4);
-        break;
-#if (NGX_HAVE_INET6)
-    case AF_INET6:
-        sin6 = (struct sockaddr_in6 *) addr->sockaddr;
-        p = ngx_cpymem(p, &sin6->sin6_addr, 16);
-        break;
-#endif
-    default:
-        p = ngx_cpymem(p, r->connection->addr_text.data, addr_len);
-        break;
-    }
+    p = ngx_cpymem(p, address, addr_len);
 
     p = ngx_cpymem(p, &user_len, 4);
     if (user_len != 0) {
@@ -836,7 +844,7 @@ ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
     ngx_http_auth_cookie_rate_shctx_t *sh;
     ngx_http_auth_cookie_rate_node_t *node, *found;
     u_char key[NGX_AUTH_COOKIE_RATE_KEY_LEN];
-    uint64_t capacity, refill;
+    uint64_t capacity, refill, used;
     ngx_msec_t now;
     ngx_msec_int_t elapsed;
     ngx_rbtree_node_t *current, *sentinel;
@@ -909,6 +917,10 @@ ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
         ngx_queue_insert_head(&sh->queue, &found->queue);
 
         elapsed = (ngx_msec_int_t) (now - found->last);
+        /* 时钟回拨沿用原有归一规则，并重置基准以免滞留未来时间。 */
+        if (elapsed < 0) {
+            found->last = now;
+        }
         if (elapsed < -60000) {
             elapsed = 1;
         } else if (elapsed < 0) {
@@ -920,11 +932,18 @@ ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
         }
         if ((ngx_msec_t) elapsed >= bucket->period) {
             found->tokens = capacity;
+            found->last = now;
         } else if (elapsed > 0) {
             refill = (uint64_t) elapsed * capacity / bucket->period;
             found->tokens = ngx_min(capacity, found->tokens + refill);
+            if (found->tokens == capacity) {
+                found->last = now;
+            } else if (refill != 0) {
+                /* 仅消耗实际回填对应的时间，向上取整避免超发令牌。 */
+                used = (refill * bucket->period + capacity - 1) / capacity;
+                found->last += (ngx_msec_t) used;
+            }
         }
-        found->last = now;
     }
 
     if (found->tokens < NGX_AUTH_COOKIE_RATE_TOKEN_SCALE) {
@@ -943,6 +962,7 @@ ngx_http_auth_cookie_rate_check(ngx_http_request_t *r,
     ngx_http_auth_cookie_rate_loc_conf_t *conf, ngx_str_t *username)
 {
     ngx_http_auth_cookie_rate_main_conf_t *amcf;
+    ngx_http_auth_cookie_main_conf_t *main;
     ngx_addr_t addr;
     ngx_int_t rc;
 
@@ -958,10 +978,11 @@ ngx_http_auth_cookie_rate_check(ngx_http_request_t *r,
         return NGX_AUTH_COOKIE_RATE_BAD_IP;
     }
 
-    amcf = ngx_http_get_module_main_conf(r, ngx_http_auth_cookie_module);
-    if (amcf == NULL) {
+    main = ngx_http_get_module_main_conf(r, ngx_http_auth_cookie_module);
+    if (main == NULL) {
         return NGX_ERROR;
     }
+    amcf = &main->rate;
 
     switch (conf->key_mode) {
     case NGX_AUTH_COOKIE_RATE_KEY_IP:

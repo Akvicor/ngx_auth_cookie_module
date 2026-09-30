@@ -15,26 +15,33 @@
 
 #define NGX_AUTH_COOKIE_USER_FILE_MAX  (1024 * 1024)
 
+/* 用户节点以区分大小写的用户名建立索引，地址在配置周期内保持稳定。 */
 typedef struct {
-    ngx_str_t  name;
+    ngx_str_node_t node;
     ngx_str_t  hash;
     u_char     fingerprint[NGX_AUTH_COOKIE_HMAC_SHA256_LEN];
 } ngx_http_auth_cookie_user_t;
 
+/* 载入去重与运行时查找共用的只读用户索引。 */
+typedef struct {
+    ngx_rbtree_t       tree;
+    ngx_rbtree_node_t  sentinel;
+} ngx_http_auth_cookie_users_t;
+
 /* 从用户文件载入内存表。结果使用传入 pool 的生命周期。 */
 ngx_int_t ngx_http_auth_cookie_load_users(ngx_pool_t *pool, ngx_log_t *log,
-    ngx_str_t *user_file, ngx_array_t **users);
+    ngx_str_t *user_file, ngx_http_auth_cookie_users_t **users);
 
 /* 按用户名查找表项;未找到返回 NULL。 */
-ngx_http_auth_cookie_user_t *ngx_http_auth_cookie_find_user(ngx_array_t *users,
-    ngx_str_t *name);
+ngx_http_auth_cookie_user_t *ngx_http_auth_cookie_lookup_user(
+    ngx_http_auth_cookie_users_t *users, ngx_str_t *name);
 
 /*
- * 校验用户与密码。
- * 返回 NGX_OK 通过;NGX_DECLINED 用户不存在或密码错误;
+ * 校验密码与已查到的用户哈希。
+ * 返回 NGX_OK 通过;NGX_DECLINED 密码错误;
  * NGX_HTTP_* 为内部错误。
  */
-ngx_int_t ngx_http_auth_cookie_check_user(ngx_http_request_t *r,
-    ngx_array_t *users, ngx_str_t *user, ngx_str_t *passwd);
+ngx_int_t ngx_http_auth_cookie_check_password(ngx_http_request_t *r,
+    ngx_str_t *passwd, ngx_str_t *hash);
 
 #endif /* _NGX_HTTP_AUTH_COOKIE_HTPASSWD_H_INCLUDED_ */

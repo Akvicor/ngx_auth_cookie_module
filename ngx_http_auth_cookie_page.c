@@ -120,7 +120,7 @@ ngx_http_auth_cookie_load_page(ngx_pool_t *pool, ngx_log_t *log,
     size_t       size;
 
     fd = ngx_open_file(path->data,
-                       NGX_FILE_RDONLY|NGX_FILE_NONBLOCK|O_NOFOLLOW,
+                       NGX_FILE_RDONLY|NGX_FILE_NONBLOCK,
                        NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) {
         ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
