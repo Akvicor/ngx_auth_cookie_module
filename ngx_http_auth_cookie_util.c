@@ -201,7 +201,7 @@ ngx_http_auth_cookie_unescape(ngx_pool_t *pool, ngx_str_t *in, ngx_str_t *out)
     size_t      i;
     ngx_int_t   hi, lo;
 
-    if (in->len > 4096) {
+    if (in->len > NGX_AUTH_COOKIE_MAX_FIELD_LEN) {
         return NGX_ERROR;
     }
 

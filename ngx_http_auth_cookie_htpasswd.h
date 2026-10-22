@@ -28,6 +28,10 @@ typedef struct {
     ngx_rbtree_node_t  sentinel;
 } ngx_http_auth_cookie_users_t;
 
+/* 表单与 Basic 共用的凭据规则：用户名长度及分隔符、密码长度及 NUL 校验。 */
+ngx_int_t ngx_http_auth_cookie_valid_username(ngx_str_t *username);
+ngx_int_t ngx_http_auth_cookie_valid_password(ngx_str_t *password);
+
 /* 从用户文件载入内存表。结果使用传入 pool 的生命周期。 */
 ngx_int_t ngx_http_auth_cookie_load_users(ngx_pool_t *pool, ngx_log_t *log,
     ngx_str_t *user_file, ngx_http_auth_cookie_users_t **users);

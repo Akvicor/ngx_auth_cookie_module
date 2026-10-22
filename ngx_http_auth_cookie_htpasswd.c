@@ -12,6 +12,38 @@
 #include "ngx_http_auth_cookie_util.h"
 
 
+ngx_int_t
+ngx_http_auth_cookie_valid_username(ngx_str_t *username)
+{
+    size_t i;
+
+    if (username->len == 0 || username->len > NGX_AUTH_COOKIE_MAX_USER_LEN) {
+        return NGX_ERROR;
+    }
+    for (i = 0; i < username->len; i++) {
+        if (username->data[i] == '\0' || username->data[i] == ':'
+            || username->data[i] == '\r' || username->data[i] == '\n')
+        {
+            return NGX_ERROR;
+        }
+    }
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_http_auth_cookie_valid_password(ngx_str_t *password)
+{
+    if (password->len == 0 || password->len > NGX_AUTH_COOKIE_MAX_FIELD_LEN
+        || ngx_strlchr(password->data, password->data + password->len, '\0')
+           != NULL)
+    {
+        return NGX_ERROR;
+    }
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_auth_cookie_hash_supported(ngx_str_t *hash)
 {

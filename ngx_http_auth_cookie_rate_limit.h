@@ -1,5 +1,5 @@
 /*
- * ngx_http_auth_cookie_module — 登录 POST 限流
+ * ngx_http_auth_cookie_module — 网页登录 POST 与 Basic 认证限流
  *
  * 令牌桶状态保存在模块级共享内存中，按认证域、客户端 IP 和可选用户名生成固定
  * 长度摘要。所有速率计算使用整数毫令牌，不使用浮点。
@@ -44,6 +44,7 @@ typedef struct {
     ngx_array_t                       *trusted_proxies;
     ngx_flag_t                         ip_headers_set;
     ngx_flag_t                         trusted_proxies_set;
+    ngx_flag_t                         refund;  /* 认证成功后退回预扣令牌 */
     u_char                             scope[NGX_AUTH_COOKIE_RATE_KEY_LEN];
     ngx_flag_t                         scope_ready;
 } ngx_http_auth_cookie_rate_loc_conf_t;
@@ -83,8 +84,19 @@ ngx_int_t ngx_http_auth_cookie_rate_zone_create(ngx_conf_t *cf,
 ngx_int_t ngx_http_auth_cookie_rate_zone_init(ngx_shm_zone_t *zone,
     void *data);
 
-/* username 为 NULL 时按 IP 键检查；返回值使用上方 NGX_AUTH_COOKIE_RATE_* 常量。 */
+/*
+ * 在密码校验前预扣令牌。username 为 NULL 时按 IP 键检查；
+ * 返回值使用上方 NGX_AUTH_COOKIE_RATE_* 常量。同一请求内部重定向时，
+ * 相同桶键及参数复用首次结果。
+ */
 ngx_int_t ngx_http_auth_cookie_rate_check(ngx_http_request_t *r,
     ngx_http_auth_cookie_rate_loc_conf_t *conf, ngx_str_t *username);
+
+/*
+ * 密码校验成功后，按 conf->refund 退回当前请求预扣且尚未退回的令牌。
+ * 失败的认证保留扣费；预扣保证并发尝试同样受额度约束。
+ */
+void ngx_http_auth_cookie_rate_refund(ngx_http_request_t *r,
+    ngx_http_auth_cookie_rate_loc_conf_t *conf);
 
 #endif /* _NGX_HTTP_AUTH_COOKIE_RATE_LIMIT_H_INCLUDED_ */

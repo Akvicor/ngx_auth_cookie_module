@@ -11,4 +11,8 @@ typedef struct {
     ngx_http_auth_cookie_file_cache_t      files;
 } ngx_http_auth_cookie_main_conf_t;
 
+/* 登录认证及登出共用同源规则；缺少浏览器来源头的客户端按原有规则放行。 */
+ngx_int_t ngx_http_auth_cookie_check_csrf(ngx_http_request_t *r,
+    ngx_flag_t enabled);
+
 #endif

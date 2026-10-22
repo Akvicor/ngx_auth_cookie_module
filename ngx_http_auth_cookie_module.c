@@ -1,11 +1,12 @@
 /*
- * ngx_http_auth_cookie_module — 通过 HMAC 签名 cookie 会话认证
+ * ngx_http_auth_cookie_module — 通过 HMAC 签名 cookie 会话认证,
+ * 并以同一用户文件接受客户端主动发送的 Basic 凭据
  *
  * 使用方式与 auth_basic 一致:在 server/location 声明 auth_cookie_user_file 即启用。
  * 登录后签发带签名的 cookie,每请求验签 + 校验过期即放行;无服务端会话表,
  * 天然支持多 worker、重启不丢会话(secret 持久化)。
  *
- * 配置项(server/location 上下文):
+ * 配置项(http/server/location 上下文,zone_size 仅 http):
  *   auth_cookie_user_file <path>      htpasswd 用户文件;声明即启用认证
  *   auth_cookie_page <value>          登录页:basic(默认)/premium/绝对路径.html
  *   auth_cookie_name <str>            cookie 名,默认 auth_cookie
@@ -15,15 +16,20 @@
  *   auth_cookie_title <str>           登录页标题,可选
  *   auth_cookie_login_uri <uri>       登录页 URI,默认 /_login
  *   auth_cookie_logout_uri <uri>      登出 URI(POST 清 cookie),可选
+ *   auth_cookie_csrf <on/off>         登录/Basic/登出的同源校验,默认 on
+ *   auth_cookie_basic <on/off>        接受主动发送的 Basic 凭据,默认 on
  *   auth_cookie_login_rate <ip_n> <ip_time> <ip_username_n> <ip_username_time>
  *                                      IP/IP+用户名令牌桶,默认 10/1000ms + 1/1000ms,可 off
  *   auth_cookie_login_rate_key <mode>  限流键:ip/username/ip_username(默认)
+ *   auth_cookie_login_rate_refund <on/off> 认证成功退回预扣令牌,默认 on
  *   auth_cookie_login_rate_ip_header   可信代理提供的客户端 IP Header
  *   auth_cookie_login_rate_trusted_proxy 可信代理 IP/CIDR/unix:
  *   auth_cookie_login_rate_zone_size   http 级每个共享内存容量,默认 1m
  *
  * 流程:
  *   已登录(验签通过)     → 放行,设置 $auth_cookie_user
+ *   Basic 凭据有效       → 放行,设置 $auth_cookie_user(auth_cookie_basic on)
+ *   Basic 凭据无效       → 401;同源校验失败 400,超出登录限流 429
  *   登录 URI GET          → 渲染登录页
  *   登录 URI POST         → 校验 htpasswd,签发 cookie,302 回 next
  *   登出 URI POST         → 清除 cookie,302
@@ -38,6 +44,7 @@
 #include "ngx_http_auth_cookie_util.h"
 #include "ngx_http_auth_cookie_crypto.h"
 #include "ngx_http_auth_cookie_htpasswd.h"
+#include "ngx_http_auth_cookie_basic.h"
 #include "ngx_http_auth_cookie_page.h"
 #include "ngx_http_auth_cookie_rate_limit.h"
 #include "ngx_http_auth_cookie_module.h"
@@ -76,6 +83,7 @@ typedef struct {
     ngx_str_t    page_tpl;    /* 自定义登录页,配置阶段载入 */
     ngx_flag_t   enabled;
     ngx_flag_t   csrf;        /* 登录/登出 POST 的同源校验开关 */
+    ngx_flag_t   basic;       /* 接受客户端主动发送的 Basic 凭据 */
     ngx_http_auth_cookie_rate_loc_conf_t rate;
 } ngx_http_auth_cookie_loc_conf_t;
 
@@ -129,8 +137,6 @@ static ngx_int_t ngx_http_auth_cookie_page_template(ngx_http_request_t *r,
 static ngx_int_t ngx_http_auth_cookie_valid_uri(ngx_str_t *uri);
 static ngx_int_t ngx_http_auth_cookie_valid_name(ngx_str_t *name);
 static ngx_int_t ngx_http_auth_cookie_check_body(ngx_http_request_t *r);
-static ngx_int_t ngx_http_auth_cookie_check_csrf(ngx_http_request_t *r,
-    ngx_http_auth_cookie_loc_conf_t *alcf);
 static ngx_table_elt_t *ngx_http_auth_cookie_find_header(ngx_http_request_t *r,
     ngx_str_t *name);
 static ngx_int_t ngx_http_auth_cookie_add_header(ngx_http_request_t *r,
@@ -180,6 +186,14 @@ static ngx_command_t  ngx_http_auth_cookie_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_auth_cookie_loc_conf_t, csrf),
+      NULL },
+
+    { ngx_string("auth_cookie_basic"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF
+                        |NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_auth_cookie_loc_conf_t, basic),
       NULL },
 
     { ngx_string("auth_cookie_secret"),
@@ -236,6 +250,14 @@ static ngx_command_t  ngx_http_auth_cookie_commands[] = {
       ngx_http_auth_cookie_login_rate_key_set,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_auth_cookie_loc_conf_t, rate),
+      NULL },
+
+    { ngx_string("auth_cookie_login_rate_refund"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF
+                        |NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_auth_cookie_loc_conf_t, rate.refund),
       NULL },
 
     { ngx_string("auth_cookie_login_rate_ip_header"),
@@ -383,6 +405,7 @@ ngx_http_auth_cookie_create_loc_conf(ngx_conf_t *cf)
     conf->session_ttl = NGX_CONF_UNSET;
     conf->secure = NGX_CONF_UNSET;
     conf->csrf = NGX_CONF_UNSET;
+    conf->basic = NGX_CONF_UNSET;
     conf->enabled = NGX_CONF_UNSET;
     conf->cookie_name.len = 0;
     conf->cookie_name.data = NULL;
@@ -430,6 +453,7 @@ ngx_http_auth_cookie_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* CSRF 同源校验默认开启,可用 auth_cookie_csrf off 关闭 */
     ngx_conf_merge_value(conf->csrf, prev->csrf, 1);
+    ngx_conf_merge_value(conf->basic, prev->basic, 1);
 
     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
 
@@ -624,21 +648,21 @@ ngx_http_auth_cookie_find_header(ngx_http_request_t *r, ngx_str_t *name)
 
 
 /*
- * 登录/登出 POST 的同源校验(CSRF 防护):
+ * 登录认证与登出共用的同源校验(CSRF 防护):
  * - 存在 Origin 时,其 host:port 必须与请求 Host 一致(忽略 scheme,
  *   以兼容 TLS 终结代理后端的 scheme 差异);Origin: null 视为不匹配。
  * - 缺失 Origin 时,Sec-Fetch-Site: cross-site 拒绝。
  * - 两者都缺失(非浏览器客户端)放行。
  */
-static ngx_int_t
+ngx_int_t
 ngx_http_auth_cookie_check_csrf(ngx_http_request_t *r,
-    ngx_http_auth_cookie_loc_conf_t *alcf)
+    ngx_flag_t enabled)
 {
     ngx_table_elt_t  *origin, *fetch_site;
     ngx_str_t         name, host, authority;
     u_char           *p, *last;
 
-    if (!alcf->csrf) {
+    if (!enabled) {
         return NGX_OK;
     }
 
@@ -1296,7 +1320,7 @@ ngx_http_auth_cookie_login_body_handler(ngx_http_request_t *r)
     ngx_http_auth_cookie_user_t      *entry;
     ngx_int_t                         rc;
     ssize_t                           n;
-    size_t                            i, part;
+    size_t                            part;
     u_char                           *p, *q, *end, *dst;
 
     alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_cookie_module);
@@ -1462,9 +1486,7 @@ ngx_http_auth_cookie_login_body_handler(ngx_http_request_t *r)
     }
     username = decoded;
 
-    if (username.len > NGX_AUTH_COOKIE_MAX_USER_LEN
-        || ngx_strlchr(username.data, username.data + username.len, '\0')
-           != NULL)
+    if (ngx_http_auth_cookie_valid_username(&username) != NGX_OK)
     {
         ngx_explicit_memzero(body.data, body.len);
         if (alcf->rate.key_mode != NGX_AUTH_COOKIE_RATE_KEY_IP
@@ -1477,24 +1499,6 @@ ngx_http_auth_cookie_login_body_handler(ngx_http_request_t *r)
         rc = ngx_http_auth_cookie_serve_login_page(r, alcf, &next, &error, NGX_HTTP_OK);
         ngx_http_finalize_request(r, rc);
         return;
-    }
-
-    for (i = 0; i < username.len; i++) {
-        if (username.data[i] == ':' || username.data[i] == '\r'
-            || username.data[i] == '\n')
-        {
-            ngx_explicit_memzero(body.data, body.len);
-            if (alcf->rate.key_mode != NGX_AUTH_COOKIE_RATE_KEY_IP
-                && ngx_http_auth_cookie_rate_body_check(r, alcf, NULL, &next)
-                   != NGX_OK)
-            {
-                return;
-            }
-            ngx_str_set(&error, "用户名无效");
-            rc = ngx_http_auth_cookie_serve_login_page(r, alcf, &next, &error, NGX_HTTP_OK);
-            ngx_http_finalize_request(r, rc);
-            return;
-        }
     }
 
     if (alcf->rate.key_mode != NGX_AUTH_COOKIE_RATE_KEY_IP) {
@@ -1522,8 +1526,7 @@ ngx_http_auth_cookie_login_body_handler(ngx_http_request_t *r)
     }
     password = decoded;
 
-    if (ngx_strlchr(password.data, password.data + password.len, '\0')
-        != NULL)
+    if (ngx_http_auth_cookie_valid_password(&password) != NGX_OK)
     {
         ngx_explicit_memzero(password.data, password.len);
         ngx_explicit_memzero(body.data, body.len);
@@ -1549,6 +1552,8 @@ ngx_http_auth_cookie_login_body_handler(ngx_http_request_t *r)
         ngx_http_finalize_request(r, rc);
         return;
     }
+
+    ngx_http_auth_cookie_rate_refund(r, &alcf->rate);
 
     /* 签发 cookie。无 Host 无法绑定会话,回登录页而不是 500。 */
     if (r->headers_in.server.len == 0) {
@@ -1644,7 +1649,7 @@ ngx_http_auth_cookie_endpoint_handler(ngx_http_request_t *r)
             return NGX_HTTP_NOT_ALLOWED;
         }
 
-        if (ngx_http_auth_cookie_check_csrf(r, alcf) != NGX_OK) {
+        if (ngx_http_auth_cookie_check_csrf(r, alcf->csrf) != NGX_OK) {
             return NGX_HTTP_BAD_REQUEST;
         }
 
@@ -1681,7 +1686,7 @@ ngx_http_auth_cookie_endpoint_handler(ngx_http_request_t *r)
             }
         }
 
-        if (ngx_http_auth_cookie_check_csrf(r, alcf) != NGX_OK) {
+        if (ngx_http_auth_cookie_check_csrf(r, alcf->csrf) != NGX_OK) {
             if (alcf->rate.key_mode != NGX_AUTH_COOKIE_RATE_KEY_IP) {
                 rc = ngx_http_auth_cookie_rate_check(r, &alcf->rate, NULL);
                 if (rc == NGX_AUTH_COOKIE_RATE_BAD_IP) {
@@ -1750,7 +1755,9 @@ ngx_http_auth_cookie_handler(ngx_http_request_t *r)
 {
     ngx_http_auth_cookie_loc_conf_t  *alcf;
     ngx_http_auth_cookie_ctx_t       *ctx;
+    ngx_pool_cleanup_t              *cln;
     ngx_str_t                         cookie_value;
+    ngx_str_t                         user;
     ngx_http_auth_cookie_session_t    session;
     ngx_str_t                         redirect_uri;
     ngx_int_t                         rc;
@@ -1793,24 +1800,27 @@ ngx_http_auth_cookie_handler(ngx_http_request_t *r)
                                            entry->fingerprint, &session)
                == NGX_OK)
         {
-            ngx_pool_cleanup_t *cln;
-
-            ctx = ngx_http_auth_cookie_get_ctx(r);
-            if (ctx == NULL) {
-                cln = ngx_pool_cleanup_add(r->pool, sizeof(*ctx));
-                if (cln == NULL) {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-                cln->handler = ngx_http_auth_cookie_ctx_cleanup;
-                ctx = cln->data;
-                ctx->request = r;
-            }
-            ctx->user = session.user;
-            ctx->authed = 1;
-            ngx_http_set_ctx(r, ctx, ngx_http_auth_cookie_module);
-
-            return NGX_OK;
+            user = session.user;
+            goto authenticated;
         }
+    }
+
+    /* 有效 Cookie 优先；主动发送的 Basic 使用同一用户表逐请求认证。 */
+    rc = NGX_DECLINED;
+    if (alcf->basic) {
+        rc = ngx_http_auth_cookie_basic(r, alcf->users, &alcf->rate,
+                                         alcf->csrf, &user);
+    }
+    if (rc == NGX_OK) {
+        goto authenticated;
+    }
+    if (rc == NGX_HTTP_UNAUTHORIZED) {
+        /* 与未认证 Cookie 的 302 一样结束请求，保持认证失败不能被 IP 放行的语义。 */
+        ngx_http_finalize_request(r, rc);
+        return NGX_DONE;
+    }
+    if (rc != NGX_DECLINED) {
+        return rc;
     }
 
     /* 未认证:302 到登录页?next=原请求 */
@@ -1820,4 +1830,22 @@ ngx_http_auth_cookie_handler(ngx_http_request_t *r)
     }
 
     return ngx_http_auth_cookie_send_redirect(r, &redirect_uri);
+
+authenticated:
+
+    ctx = ngx_http_auth_cookie_get_ctx(r);
+    if (ctx == NULL) {
+        cln = ngx_pool_cleanup_add(r->pool, sizeof(*ctx));
+        if (cln == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        cln->handler = ngx_http_auth_cookie_ctx_cleanup;
+        ctx = cln->data;
+        ctx->request = r;
+    }
+    ctx->user = user;
+    ctx->authed = 1;
+    ngx_http_set_ctx(r, ctx, ngx_http_auth_cookie_module);
+
+    return NGX_OK;
 }

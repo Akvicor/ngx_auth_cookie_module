@@ -1,5 +1,5 @@
 /*
- * ngx_http_auth_cookie_module — 登录 POST 限流实现
+ * ngx_http_auth_cookie_module — 网页登录 POST 与 Basic 认证限流实现
  */
 
 #include <ngx_config.h>
@@ -39,6 +39,19 @@ typedef struct {
     ngx_msec_t         last;
     u_char             key[NGX_AUTH_COOKIE_RATE_KEY_LEN];
 } ngx_http_auth_cookie_rate_node_t;
+
+/*
+ * 请求池记录每个桶的扣费结果：内部重定向按桶键和参数复用结果，
+ * 认证成功时据此退回令牌；子请求各自计数。
+ */
+typedef struct {
+    ngx_http_request_t                      *request;
+    ngx_shm_zone_t                          *zone;
+    ngx_http_auth_cookie_rate_bucket_conf_t  bucket;
+    u_char                                   key[NGX_AUTH_COOKIE_RATE_KEY_LEN];
+    ngx_int_t                                result;
+    ngx_flag_t                               refunded;
+} ngx_http_auth_cookie_rate_request_t;
 
 
 static ngx_int_t ngx_http_auth_cookie_rate_header_valid(ngx_str_t *name);
@@ -362,6 +375,7 @@ ngx_http_auth_cookie_rate_create_loc_conf(
     conf->trusted_proxies = NGX_CONF_UNSET_PTR;
     conf->ip_headers_set = 0;
     conf->trusted_proxies_set = 0;
+    conf->refund = NGX_CONF_UNSET;
     conf->scope_ready = 0;
 }
 
@@ -380,6 +394,7 @@ ngx_http_auth_cookie_rate_merge_loc_conf(ngx_conf_t *cf,
 
     ngx_conf_merge_uint_value(conf->key_mode, prev->key_mode,
                               NGX_AUTH_COOKIE_RATE_KEY_IP_USERNAME);
+    ngx_conf_merge_value(conf->refund, prev->refund, 1);
 
     if (conf->ip_headers == NGX_CONF_UNSET_PTR) {
         conf->ip_headers = prev->ip_headers;
@@ -834,6 +849,49 @@ ngx_http_auth_cookie_rate_zone_init(ngx_shm_zone_t *zone, void *data)
 }
 
 
+/* cleanup 标识在内部重定向清空模块 ctx 后仍可定位请求级计数记录。 */
+static void
+ngx_http_auth_cookie_rate_request_cleanup(void *data)
+{
+    ngx_http_auth_cookie_rate_request_t *record = data;
+
+    ngx_memzero(record, sizeof(*record));
+}
+
+
+/* 调用方持有共享内存锁。 */
+static ngx_http_auth_cookie_rate_node_t *
+ngx_http_auth_cookie_rate_lookup(ngx_http_auth_cookie_rate_shctx_t *sh,
+    u_char *key, uint32_t hash)
+{
+    ngx_http_auth_cookie_rate_node_t *node;
+    ngx_rbtree_node_t *current, *sentinel;
+    ngx_int_t rc;
+
+    sentinel = sh->rbtree.sentinel;
+    current = sh->rbtree.root;
+    while (current != sentinel) {
+        if (hash < current->key) {
+            current = current->left;
+            continue;
+        }
+        if (hash > current->key) {
+            current = current->right;
+            continue;
+        }
+
+        node = (ngx_http_auth_cookie_rate_node_t *) current;
+        rc = ngx_memcmp(key, node->key, NGX_AUTH_COOKIE_RATE_KEY_LEN);
+        if (rc == 0) {
+            return node;
+        }
+        current = rc < 0 ? current->left : current->right;
+    }
+
+    return NULL;
+}
+
+
 static ngx_int_t
 ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
     ngx_shm_zone_t *zone, ngx_http_auth_cookie_rate_loc_conf_t *conf,
@@ -842,14 +900,14 @@ ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
 {
     ngx_http_auth_cookie_rate_zone_ctx_t *ctx;
     ngx_http_auth_cookie_rate_shctx_t *sh;
-    ngx_http_auth_cookie_rate_node_t *node, *found;
+    ngx_http_auth_cookie_rate_node_t *found;
     u_char key[NGX_AUTH_COOKIE_RATE_KEY_LEN];
     uint64_t capacity, refill, used;
     ngx_msec_t now;
     ngx_msec_int_t elapsed;
-    ngx_rbtree_node_t *current, *sentinel;
     uint32_t hash;
-    ngx_int_t rc;
+    ngx_pool_cleanup_t *cln;
+    ngx_http_auth_cookie_rate_request_t *record;
 
     if (zone == NULL || zone->data == NULL) {
         return NGX_ERROR;
@@ -866,6 +924,33 @@ ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    for (cln = r->pool->cleanup; cln; cln = cln->next) {
+        if (cln->handler != ngx_http_auth_cookie_rate_request_cleanup) {
+            continue;
+        }
+        record = cln->data;
+        if (record->request == r && record->zone == zone
+            && record->bucket.capacity == bucket->capacity
+            && record->bucket.period == bucket->period
+            && ngx_memcmp(record->key, key, sizeof(key)) == 0)
+        {
+            return record->result;
+        }
+    }
+
+    cln = ngx_pool_cleanup_add(r->pool, sizeof(*record));
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+    cln->handler = ngx_http_auth_cookie_rate_request_cleanup;
+    record = cln->data;
+    record->request = r;
+    record->zone = zone;
+    record->bucket = *bucket;
+    ngx_memcpy(record->key, key, sizeof(key));
+    record->result = NGX_AUTH_COOKIE_RATE_DENIED;
+    record->refunded = 0;
+
     capacity = (uint64_t) bucket->capacity
                * NGX_AUTH_COOKIE_RATE_TOKEN_SCALE;
     now = ngx_current_msec;
@@ -873,25 +958,7 @@ ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
 
     ngx_shmtx_lock(&ctx->shpool->mutex);
 
-    sentinel = sh->rbtree.sentinel;
-    current = sh->rbtree.root;
-    found = NULL;
-    while (current != sentinel) {
-        node = (ngx_http_auth_cookie_rate_node_t *) current;
-        if (hash < current->key) {
-            current = current->left;
-        } else if (hash > current->key) {
-            current = current->right;
-        } else {
-            rc = ngx_memcmp(key, node->key, sizeof(key));
-            if (rc == 0) {
-                found = node;
-                break;
-            }
-            current = rc < 0 ? current->left : current->right;
-        }
-    }
-
+    found = ngx_http_auth_cookie_rate_lookup(sh, key, hash);
     if (found == NULL) {
         found = ngx_slab_alloc_locked(ctx->shpool, sizeof(*found));
         while (found == NULL && !ngx_queue_empty(&sh->queue)) {
@@ -953,7 +1020,55 @@ ngx_http_auth_cookie_rate_bucket_check(ngx_http_request_t *r,
 
     found->tokens -= NGX_AUTH_COOKIE_RATE_TOKEN_SCALE;
     ngx_shmtx_unlock(&ctx->shpool->mutex);
+    record->result = NGX_AUTH_COOKIE_RATE_ALLOWED;
     return NGX_AUTH_COOKIE_RATE_ALLOWED;
+}
+
+
+void
+ngx_http_auth_cookie_rate_refund(ngx_http_request_t *r,
+    ngx_http_auth_cookie_rate_loc_conf_t *conf)
+{
+    ngx_pool_cleanup_t *cln;
+    ngx_http_auth_cookie_rate_request_t *record;
+    ngx_http_auth_cookie_rate_zone_ctx_t *ctx;
+    ngx_http_auth_cookie_rate_node_t *node;
+    uint64_t capacity;
+
+    if (!conf->refund) {
+        return;
+    }
+
+    for (cln = r->pool->cleanup; cln; cln = cln->next) {
+        if (cln->handler != ngx_http_auth_cookie_rate_request_cleanup) {
+            continue;
+        }
+        record = cln->data;
+        if (record->request != r || record->refunded
+            || record->result != NGX_AUTH_COOKIE_RATE_ALLOWED)
+        {
+            continue;
+        }
+        record->refunded = 1;
+
+        ctx = record->zone->data;
+        if (ctx == NULL || ctx->sh == NULL) {
+            continue;
+        }
+        capacity = (uint64_t) record->bucket.capacity
+                   * NGX_AUTH_COOKIE_RATE_TOKEN_SCALE;
+
+        ngx_shmtx_lock(&ctx->shpool->mutex);
+        /* 节点被 LRU 淘汰后，下次检查会按满额重建，此时无需退回。 */
+        node = ngx_http_auth_cookie_rate_lookup(ctx->sh, record->key,
+                   ngx_http_auth_cookie_rate_hash(record->key,
+                                                  NGX_AUTH_COOKIE_RATE_KEY_LEN));
+        if (node != NULL) {
+            node->tokens = ngx_min(capacity,
+                                   node->tokens + NGX_AUTH_COOKIE_RATE_TOKEN_SCALE);
+        }
+        ngx_shmtx_unlock(&ctx->shpool->mutex);
+    }
 }
 
 

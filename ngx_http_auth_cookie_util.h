@@ -12,6 +12,9 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+/* 认证字段的长度上限；表单在 URL 解码前应用，Basic 在 Base64 解码后应用。 */
+#define NGX_AUTH_COOKIE_MAX_FIELD_LEN  4096
+
 /* base64url 编码(无填充);结果写入 pool,返回 NGX_OK */
 ngx_int_t ngx_http_auth_cookie_b64url_encode(ngx_pool_t *pool,
     const u_char *in, size_t in_len, ngx_str_t *out);

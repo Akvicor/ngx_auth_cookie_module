@@ -4,7 +4,8 @@
 
 [博客链接](https://www.ksyaki.com/archives/nginx-cookiedeng-lu-ren-zheng-cha-jian)
 
-`ngx_http_auth_cookie_module` 为 nginx 提供基于 HMAC 签名 Cookie 的会话认证。
+`ngx_http_auth_cookie_module` 为 nginx 提供基于 HMAC 签名 Cookie 的会话认证，
+以及共用用户文件和登录限流的 HTTP Basic 客户端认证。
 
 ## 构建
 
@@ -34,8 +35,10 @@ server {
     # auth_cookie_login_uri /_login;
     # auth_cookie_logout_uri /_logout;
     # auth_cookie_csrf on;
+    # auth_cookie_basic on;
     # auth_cookie_login_rate 10 1000ms 1 1000ms;
     # auth_cookie_login_rate_key ip_username;
+    # auth_cookie_login_rate_refund on;
     # auth_cookie_login_rate_trusted_proxy 203.0.113.0/24;
     # auth_cookie_login_rate_ip_header X-Forwarded-For;
 
@@ -56,9 +59,11 @@ server {
 | `auth_cookie_title <text>` | `登录` | 登录页标题 |
 | `auth_cookie_login_uri <uri>` | `/_login` | 登录 URI |
 | `auth_cookie_logout_uri <uri>` | 未设置 | POST 登出 URI |
-| `auth_cookie_csrf <on\|off>` | `on` | 登录/登出 POST 的同源校验 |
-| `auth_cookie_login_rate <IP容量> <IP周期> <IP+用户名容量> <IP+用户名周期> \| off` | `10 1000ms 1 1000ms` | 登录 POST 的 IP 桶和 IP+用户名桶参数；`off` 关闭全部限流 |
+| `auth_cookie_csrf <on\|off>` | `on` | 网页登录、Basic 认证与登出共用的同源校验 |
+| `auth_cookie_basic <on\|off>` | `on` | 接受客户端主动发送的 HTTP Basic 凭据 |
+| `auth_cookie_login_rate <IP容量> <IP周期> <IP+用户名容量> <IP+用户名周期> \| off` | `10 1000ms 1 1000ms` | 网页登录 POST 与 Basic 认证共用的 IP 桶和 IP+用户名桶参数；`off` 关闭全部限流 |
 | `auth_cookie_login_rate_key <ip\|username\|ip_username>` | `ip_username` | 登录限流统计键；`ip_username` 先检查 IP 桶再检查 IP+用户名桶 |
+| `auth_cookie_login_rate_refund <on\|off>` | `on` | 网页登录和 Basic 认证成功后退回预扣令牌；`off` 时成功也计数 |
 | `auth_cookie_login_rate_zone_size <size>` | `1m` | 每个登录限流共享内存区的容量，只能在 `http` 层级配置 |
 | `auth_cookie_login_rate_trusted_proxy <IP或CIDR或unix:...>` | 空 | 可信代理，可多行或多值配置 |
 | `auth_cookie_login_rate_ip_header <header...>` | 未设置 | 显式 IP Header 顺序，可多行或多值配置 |
@@ -83,6 +88,42 @@ location /private/ {
 ```
 
 server 级配置可直接使用默认 `/_login`。
+
+### HTTP Basic 兼容认证
+
+设置 `auth_cookie_user_file` 后，同一用户文件同时用于网页登录和客户端主动发送的
+HTTP Basic 认证。`auth_cookie_basic off` 时 Basic 请求头不参与认证和登录限流，
+请求按未认证处理并跳转网页登录。旧服务可直接发送 `Authorization: Basic ...`，例如：
+
+```sh
+curl -u '用户名:密码' https://app.example.com/private/
+```
+
+有效 Cookie 优先；没有有效 Cookie 时，Basic 凭据通过后直接访问资源，并设置
+`$auth_cookie_user`，会话 Cookie 由网页登录流程签发。Basic 用户文件同样支持 APR1
+和 bcrypt，修改后在 reload 或重启时生效。内部重定向按目标 location 的用户表重新校验。
+原始 Authorization 请求头保留，供反向代理和其他认证模块使用。
+
+两种认证入口共用用户名、密码校验和 `auth_cookie_csrf` 同源规则。用户名最长
+128 字节，并拒绝 NUL、冒号、回车和换行；密码非空且拒绝 NUL。表单字段的 4096 字节
+上限在 URL 解码前检查，Basic 密码在 Base64 解码后按同一上限检查。
+认证凭据来自 Basic 请求头，业务请求体继续遵循应用自身的上传配置；登录/登出
+接口保持原有的表单体大小及长度要求。
+
+未携带 Basic 凭据的请求继续跳转网页登录；Basic 格式错误、用户不存在或密码错误
+返回 401，同源校验失败返回 400，超出登录限流返回 429，显式 IP Header 模式下来源
+无效返回 400。模块不发送 `WWW-Authenticate` 挑战，因此浏览器继续使用网页登录页，
+不会由本模块触发原生认证弹框。客户端应主动发送 Basic 头（如 `curl -u`），而非等待
+401 挑战后再发送；仅使用本模块即可提供这条兼容路径。额外配置的原生 `auth_basic`
+仍按其自身规则发送挑战。与 Cookie 路径一致，认证失败直接返回响应，
+认证成功后其他访问控制按 `satisfy` 配置执行。
+
+Basic 按请求校验密码，并与网页登录 POST 共用 `auth_cookie_login_rate` 限额，
+计数规则见“登录限流”。默认认证成功的 Basic 请求不消耗额度，因此持有正确凭据的
+客户端每次请求都会计算一次密码哈希；高频调用的账号建议使用 APR1 或较低的 bcrypt
+cost，也可配置 `auth_cookie_login_rate_refund off` 让成功请求同样计数。
+内部重定向时，相同桶键及限流参数只检查一次；目标认证域变化时按目标配置检查和校验。
+已通过 Cookie 认证的资源访问沿用会话，不涉及登录额度。生产环境使用 HTTPS。
 
 ## 自定义页面
 
@@ -128,7 +169,9 @@ Cookie 带 `Secure`、`Path=/` 且为 host-only，因此同一注册域的其他
 
 登录后会清零模块的密码副本及原始内存请求体，清零是尽力而为：TLS、HTTP/2 等内部
 缓冲区仍可能残留明文。登录 location 应使用内存请求体，保持 `client_body_in_file_only off`；
-core dump 可能包含近期登录的明文密码，应限制生成与分发。
+core dump 可能包含近期登录的明文密码，应限制生成与分发。Basic 认证时模块清零
+用于哈希计算的密码副本；请求头解码出的用户名和密码与 `$remote_user` 及原生
+`auth_basic` 共用，保留至请求结束。
 
 登录/登出 POST 的请求体上限为 8KB（不含请求头，不影响受保护应用的上传）。有请求体时
 须带 `Content-Length`，chunked 或 HTTP/2、HTTP/3 有请求体却无长度时返回 411；明确长度
@@ -137,11 +180,16 @@ core dump 可能包含近期登录的明文密码，应限制生成与分发。
 
 ## 登录限流
 
-模块默认只限制登录 URI 的 POST，并使用 `ip_username` 两级限流。IP 桶默认为每个来源
-10 次/1000ms，IP+用户名桶默认为每个 IP+用户名组合 1 次/1000ms。成功、密码错误、
-表单错误和 CSRF 失败的登录 POST 都消耗令牌；GET/HEAD 登录页和登出 POST 不计入。
-超限返回 HTTP 429，并复用登录页显示错误。限流状态由全部 worker 共享，同一个
-Nginx 实例内按认证配置隔离。
+模块对登录 URI 的 POST 和资源请求中的 Basic 认证限流，默认使用 `ip_username` 两级限流。
+IP 桶默认为每个来源
+10 次/1000ms，IP+用户名桶默认为每个 IP+用户名组合 1 次/1000ms。
+每次网页登录 POST 和 Basic 认证在密码校验前预扣令牌，密码校验成功后退回
+（`auth_cookie_login_rate_refund off` 时成功也保留扣费）；
+密码错误、用户名不存在、表单或凭据格式错误、CSRF 失败均保留扣费。预扣使并发
+尝试同样受额度约束；额度耗尽时，正确密码也返回 429，直到令牌恢复。
+GET/HEAD 登录页、登出 POST 和已通过 Cookie 认证的资源访问不计入。
+超限返回 HTTP 429，网页登录复用登录页显示错误，Basic 返回标准错误响应。
+限流状态由全部 worker 共享，同一个 Nginx 实例内按认证配置隔离。
 
 ```nginx
 auth_cookie_login_rate 10 1m 1 10s;    # 每个 IP 10 次/分钟，每个 IP+用户名 6 次/分钟
@@ -150,7 +198,8 @@ auth_cookie_login_rate_key ip_username;
 
 `ip` 模式使用前两参数限制 IP；`username` 模式使用后两参数限制来源 IP + 用户名；
 `ip_username` 模式先用前两参数检查 IP，再用后两参数检查来源 IP + 用户名。
-无法取得有效用户名的登录 POST 回退到来源 IP。令牌和恢复周期都使用整数计算，不使用浮点。
+CSRF 失败、空用户名或空密码，以及无法取得有效用户名的认证尝试回退到来源 IP。
+令牌和恢复周期都使用整数计算，不使用浮点。
 
 IPv4 按单个地址计数，IPv6 按 /64 聚合；IPv4 映射地址归一为 IPv4。同一 /64 的用户
 共享来源额度。限流按来源统计，多个来源分散爆破同一账号仍有各自额度；安全依赖强密码。
@@ -197,7 +246,7 @@ auth_cookie_login_rate_zone_size 4m;
 `auth_basic`、`auth_request` 等配置会先约束登录入口，
 被拒绝的来源返回 403 而非登录页。
 
-`auth_cookie_csrf` 默认开启：登录/登出 POST 带 `Origin` 头时要求其
+`auth_cookie_csrf` 默认开启：网页登录、Basic 认证和登出请求带 `Origin` 头时要求其
 host:port 与请求 Host 一致（比较忽略 scheme，以兼容 TLS 终结代理），
 `Origin: null` 与 `Sec-Fetch-Site: cross-site` 被拒绝；
 无 Origin 的非浏览器客户端（如 curl）不受影响。
@@ -209,8 +258,8 @@ host:port 与请求 Host 一致（比较忽略 scheme，以兼容 TLS 终结代�
 log_format auth '$remote_addr user=$auth_cookie_user "$request" $status';
 ```
 
-该变量保留本次请求中最近一次验签通过的用户名，包括内部重定向到公开 location 后的
-日志；每个启用认证的目标 location 仍独立验签。
+该变量保留本次请求中最近一次 Cookie 或 Basic 认证通过的用户名，包括内部重定向到
+公开 location 后的日志；每个启用认证的目标 location 仍独立认证。
 
 ## htpasswd
 
@@ -228,14 +277,22 @@ htpasswd -B /etc/nginx/htpasswd alice
 密码哈希在 worker 中同步计算，期间同 worker 的其他连接等待。bcrypt cost 的耗时随
 机器变化，本机参考值为 cost 5 约 1.4ms、10 约 39ms、12 约 156ms。推荐 cost 不超过
 10；超过 10 时加载用户文件会告警，不影响启动或认证，且每个文件快照只告警一次。
-登录限流是控制计算负载的主要防线。
+登录限流约束失败认证的哈希次数；默认认证成功不计入限流，Basic 的哈希负载随持有
+正确凭据的客户端请求频率增长，`auth_cookie_login_rate_refund off` 可将其一并限流。
 
 ## 验证
 
-在 nginx 源码目录中完成配置后执行：
+在本模块仓库根目录执行。单元测试需要 C 编译器和 OpenSSL 开发库；集成测试还需要
+curl、openssl 命令及已静态编入本模块的 nginx 二进制。集成测试构建须启用
+`--with-http_ssl_module --with-http_v2_module --with-http_realip_module --with-http_auth_request_module`；
+nginx worker 须能访问测试临时目录。
 
 ```sh
-make
+# 单元测试(编译正式实现,无需构建 nginx)
+make verify
+
+# 集成与安全回归测试(需要已构建的 nginx 二进制)
+make test NGINX_BIN=/absolute/path/to/nginx
 ```
 
 部署前使用 `nginx -t` 检查配置。

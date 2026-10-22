@@ -1,5 +1,6 @@
 #  ngx_http_auth_cookie_module — nginx 第三方认证模块
 #  提供 auth_cookie_* 配置项,通过 HMAC 签名 cookie 会话认证,
+#  并以同一用户文件接受客户端主动发送的 Basic 凭据;
 #  使用方式与 auth_basic 一致(server/location 声明即启用)。
 
 ngx_addon_name=ngx_http_auth_cookie_module
@@ -15,6 +16,7 @@ if test -n "$ngx_module_link"; then
     ngx_module_name=ngx_http_auth_cookie_module
     ngx_module_incs=
     ngx_module_deps="$ngx_addon_dir/ngx_http_auth_cookie_module.h \
+                     $ngx_addon_dir/ngx_http_auth_cookie_basic.h \
                      $ngx_addon_dir/ngx_http_auth_cookie_file_cache.h \
                      $ngx_addon_dir/ngx_http_auth_cookie_htpasswd.h \
                      $ngx_addon_dir/ngx_http_auth_cookie_crypto.h \
@@ -22,6 +24,7 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/ngx_http_auth_cookie_page.h \
                      $ngx_addon_dir/ngx_http_auth_cookie_rate_limit.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_auth_cookie_module.c \
+                     $ngx_addon_dir/ngx_http_auth_cookie_basic.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_file_cache.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_util.c \
                      $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \
@@ -32,6 +35,7 @@ if test -n "$ngx_module_link"; then
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_auth_cookie_module"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_auth_cookie_module.c \
+                    $ngx_addon_dir/ngx_http_auth_cookie_basic.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_file_cache.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_util.c \
                     $ngx_addon_dir/ngx_http_auth_cookie_crypto.c \

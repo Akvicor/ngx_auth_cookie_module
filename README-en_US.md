@@ -4,8 +4,8 @@
 
 [Blog](https://www.ksyaki.com/archives/nginx-cookiedeng-lu-ren-zheng-cha-jian)
 
-
-`ngx_http_auth_cookie_module` provides nginx with session authentication based on HMAC-signed cookies.
+`ngx_http_auth_cookie_module` provides nginx with HMAC-signed cookie sessions and
+HTTP Basic client authentication sharing the same user file and login rate limits.
 
 ## Build
 
@@ -35,8 +35,10 @@ server {
     # auth_cookie_login_uri /_login;
     # auth_cookie_logout_uri /_logout;
     # auth_cookie_csrf on;
+    # auth_cookie_basic on;
     # auth_cookie_login_rate 10 1000ms 1 1000ms;
     # auth_cookie_login_rate_key ip_username;
+    # auth_cookie_login_rate_refund on;
     # auth_cookie_login_rate_trusted_proxy 203.0.113.0/24;
     # auth_cookie_login_rate_ip_header X-Forwarded-For;
 
@@ -57,9 +59,11 @@ server {
 | `auth_cookie_title <text>` | `Login` | Login page title |
 | `auth_cookie_login_uri <uri>` | `/_login` | Login URI |
 | `auth_cookie_logout_uri <uri>` | Not set | POST logout URI |
-| `auth_cookie_csrf <on\|off>` | `on` | Same-origin check for login/logout POST requests |
-| `auth_cookie_login_rate <IP capacity> <IP period> <IP+username capacity> <IP+username period> \| off` | `10 1000ms 1 1000ms` | Login POST IP bucket and IP+username bucket parameters; `off` disables all limiting |
+| `auth_cookie_csrf <on\|off>` | `on` | Shared same-origin check for web login, Basic authentication, and logout |
+| `auth_cookie_basic <on\|off>` | `on` | Accept preemptive HTTP Basic credentials from clients |
+| `auth_cookie_login_rate <IP capacity> <IP period> <IP+username capacity> <IP+username period> \| off` | `10 1000ms 1 1000ms` | Shared IP and IP+username bucket parameters for web login POSTs and Basic authentication; `off` disables all limiting |
 | `auth_cookie_login_rate_key <ip\|username\|ip_username>` | `ip_username` | Login rate limit key; `ip_username` checks the IP bucket before the IP+username bucket |
+| `auth_cookie_login_rate_refund <on\|off>` | `on` | Refund reserved tokens after successful web login or Basic authentication; `off` counts successes too |
 | `auth_cookie_login_rate_zone_size <size>` | `1m` | Size of each login rate limit shared memory zone; only valid at `http` level |
 | `auth_cookie_login_rate_trusted_proxy <IP or CIDR or unix:...>` | Empty | Trusted proxies; supports multiple values and repeated directives |
 | `auth_cookie_login_rate_ip_header <header...>` | Not set | Ordered IP headers; supports multiple values and repeated directives |
@@ -85,6 +89,55 @@ location /private/ {
 ```
 
 Server-level configuration can use the default `/_login` directly.
+
+### HTTP Basic Compatibility
+
+Setting `auth_cookie_user_file` enables both web login and preemptive HTTP Basic
+authentication against the same user file. With `auth_cookie_basic off`, Basic
+headers take no part in authentication or login rate limiting, and requests are
+treated as unauthenticated and redirected to web login. Legacy clients can send an
+`Authorization: Basic ...` header directly:
+
+```sh
+curl -u 'username:password' https://app.example.com/private/
+```
+
+A valid cookie takes precedence. Otherwise, valid Basic credentials grant access
+and populate `$auth_cookie_user`; session cookies are issued through web login.
+Basic supports the same APR1 and bcrypt hashes and configuration-time user
+snapshot, refreshed on reload or restart. Internal redirects authenticate against
+the destination location's user table. The original Authorization header is
+preserved for upstreams and other authentication modules.
+
+Both authentication methods share username/password validation and
+`auth_cookie_csrf` checks. Usernames are limited to 128 bytes and reject NUL,
+colons, CR, and LF; passwords must be nonempty and reject NUL. Form fields are
+limited to 4096 bytes before URL decoding; Basic passwords use the same limit
+after Base64 decoding. Basic credentials come from the request header, while
+application request bodies follow the application's upload configuration.
+Login/logout endpoints retain their existing body size and length requirements.
+
+Requests without Basic credentials continue to redirect to web login. Malformed
+Basic credentials, unknown users, and incorrect passwords receive 401; same-origin
+check failures receive 400, login rate limit excess receives 429, and an invalid
+source in explicit IP header mode receives 400. This module
+sends no `WWW-Authenticate` challenge, so it does not trigger a browser's native
+authentication dialog. Clients must send Basic credentials preemptively (as
+`curl -u` does), rather than wait for a challenge. This module alone provides the
+compatibility path; a separately configured native `auth_basic` module retains
+its own challenge behavior. As with cookie authentication, a failed authentication
+ends the request; after successful authentication, other access controls follow
+`satisfy`.
+
+Basic verifies passwords per request and shares `auth_cookie_login_rate` quotas
+with web login POSTs; see Login Rate Limiting for accounting. By default,
+successful Basic authentication does not consume quota, so clients with valid
+credentials incur one password hash per request; frequently used accounts should
+use APR1 or a low bcrypt cost, or configure `auth_cookie_login_rate_refund off`
+to count successes as well. Internal redirects check each bucket key and rate configuration
+once per request; a different authentication scope uses the destination's limits
+and user table. Requests authenticated by a valid cookie use their existing
+session and do not involve login quota. Use HTTPS in production.
 
 ## Custom Pages
 
@@ -139,7 +192,10 @@ authentication security relies on rate limiting and strong passwords.
 After login, password copies and the original in-memory request body are cleared
 on a best-effort basis. TLS, HTTP/2, and other internal buffers may retain plaintext.
 Keep `client_body_in_file_only off` for login locations. Core dumps may contain
-recent plaintext passwords, so restrict their creation and distribution.
+recent plaintext passwords, so restrict their creation and distribution. For Basic
+authentication, the module clears its password copy used for hashing; the username
+and password decoded from the request header are shared with `$remote_user` and
+native `auth_basic`, and remain until the request ends.
 
 Login/logout POST bodies are limited to 8KB, excluding headers and independently
 of protected application uploads. Requests with a body require `Content-Length`;
@@ -150,14 +206,20 @@ is independent of the application's `client_max_body_size`.
 
 ## Login Rate Limiting
 
-By default, the module limits only POST requests to the login URI and uses the
-two-level `ip_username` mode. The IP bucket allows 10 requests per source IP every
-1000 ms, while the IP+username bucket allows one request per source IP + username
-pair every 1000 ms. Successful attempts, wrong passwords, malformed forms, and CSRF
-failures consume tokens; GET/HEAD requests for the login page and logout POST
-requests do not. Excess requests receive HTTP 429 with the login page and an error
-message. State is shared by all workers and isolated per effective authentication
-configuration within the same nginx instance.
+The module limits POST requests to the login URI and Basic authentication on
+protected resources, using the two-level `ip_username` mode by default. The IP bucket allows
+10 requests per source IP every 1000 ms, while the IP+username bucket allows one request per source IP + username
+pair every 1000 ms. Each web login POST and Basic authentication reserves tokens
+before password verification and refunds them after successful verification
+(with `auth_cookie_login_rate_refund off`, successes keep the charge).
+Wrong passwords, unknown users, malformed forms or credentials, and CSRF failures
+keep the charge. Reservation bounds concurrent attempts by the same quota; once
+exhausted, correct passwords also receive 429 until tokens recover.
+GET/HEAD requests for the login page, logout POSTs, and cookie-authenticated
+resource requests do not. Excess requests receive HTTP 429, with the login page
+for web login or a standard error response for Basic. State is shared by all
+workers and isolated per effective authentication configuration within the same
+nginx instance.
 
 ```nginx
 auth_cookie_login_rate 10 1m 1 10s;    # 10 requests/minute per IP, 6 requests/minute per IP+username
@@ -167,9 +229,9 @@ auth_cookie_login_rate_key ip_username;
 The `ip` mode uses the first two parameters to limit each IP. The `username` mode
 uses the last two parameters to limit each source IP + username. The `ip_username`
 mode checks the IP bucket with the first two parameters and then checks the source
-IP + username bucket with the last two parameters. Login POST requests without a
-valid username fall back to the source IP key. Token accounting uses integer
-arithmetic only.
+IP + username bucket with the last two parameters. CSRF failures, empty credentials,
+and attempts without a valid username fall back to the source IP key. Token
+accounting uses integer arithmetic only.
 
 IPv4 is counted per address, IPv6 per /64 prefix, and IPv4-mapped addresses are
 normalized to IPv4. Users in one /64 share the source allowance. Distributed
@@ -227,7 +289,7 @@ Login and logout URIs run after same-level access controls: `satisfy`,
 `allow`/`deny`, `auth_basic`, and `auth_request` constrain the login entry
 first, and rejected sources receive 403 instead of the login page.
 
-`auth_cookie_csrf` is enabled by default: a login/logout POST carrying an
+`auth_cookie_csrf` is enabled by default: web login, Basic authentication, and logout carrying an
 `Origin` header must match the request Host in host:port (the comparison
 ignores the scheme, so TLS-terminating proxies work), while `Origin: null` and
 `Sec-Fetch-Site: cross-site` are rejected. Non-browser clients without an
@@ -240,9 +302,9 @@ The `$auth_cookie_user` variable contains the currently authenticated username a
 log_format auth '$remote_addr user=$auth_cookie_user "$request" $status';
 ```
 
-The variable retains the last successfully verified username for this request,
-including logs after internal redirects to public locations. Each protected
-destination location still verifies the cookie independently.
+The variable retains the last successfully authenticated Cookie or Basic username
+for this request, including logs after internal redirects to public locations.
+Each protected destination location still authenticates independently.
 
 ## htpasswd
 
@@ -261,15 +323,25 @@ Password hashing is synchronous in the worker, blocking its other connections
 until completion. Costs vary by hardware; local measurements were approximately
 1.4ms at bcrypt cost 5, 39ms at cost 10, and 156ms at cost 12. A cost no greater
 than 10 is recommended. Higher costs generate a warning once per loaded user file
-snapshot without rejecting startup or authentication. Login rate limiting is the
-main control for hashing load.
+snapshot without rejecting startup or authentication. Login rate limits bound
+hashing for failed attempts. By default, successful authentication is not counted,
+so Basic hashing load grows with the request rate of clients holding valid
+credentials; `auth_cookie_login_rate_refund off` limits those requests as well.
 
 ## Verification
 
-After configuring the nginx source tree, run:
+Run from this module's repository root. Unit tests require a C compiler and OpenSSL
+development libraries. Integration tests also require curl, the openssl command,
+and an nginx binary with this module statically compiled in. The integration test
+build requires `--with-http_ssl_module --with-http_v2_module --with-http_realip_module --with-http_auth_request_module`.
+The nginx worker must have access to the test temporary directory.
 
 ```sh
-make
+# Unit tests against the real implementation (no nginx build required)
+make verify
+
+# Integration and security regression tests (require a built nginx binary)
+make test NGINX_BIN=/absolute/path/to/nginx
 ```
 
 Check the deployed configuration with `nginx -t`.
